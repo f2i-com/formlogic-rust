@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/formlogic-core", "crates/formlogic-wasm"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Softn"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

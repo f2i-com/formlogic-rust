@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>formlogic-wasm smoke test</title>
+</head>
+<body>
+  <h1>formlogic-wasm smoke test</h1>
+  <pre id="out">loading...</pre>
+  <script type="module">
+    import init, { WasmFormLogicEngine, wasm_engine_info } from "../../../dist-wasm/formlogic_wasm.js";
+
+    const out = document.getElementById("out");
+    try {
+      await init();
+      const engine = new WasmFormLogicEngine();
+      const value = engine.eval("let x = 7; x * 6;");
+      out.textContent = `ok\n${wasm_engine_info()}\nresult=${value}`;
+    } catch (err) {
+      out.textContent = `error\n${String(err)}`;
+    }
+  </script>
+</body>
+</html>

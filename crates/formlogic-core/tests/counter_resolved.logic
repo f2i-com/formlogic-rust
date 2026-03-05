@@ -1,0 +1,4787 @@
+// ============================================================================
+// Counter example — pure formlogic
+// Demonstrates: createNode, setBuilderFn, event handling, state, invalidate
+// ============================================================================
+
+// ============================================================================
+// softn-formlogic stdlib: runtime.logic
+// Core rendering framework — component registry, tree building, layout, render
+// ============================================================================
+
+// NOTE: color.logic and components/index.logic are imported AFTER core
+// definitions below, because component files call registerComponent() etc.
+// at top level during import resolution.
+
+// ============================================================================
+// Theme / default styles
+// ============================================================================
+
+let _theme = {
+    fontFamily: "system-ui",
+    fontSize: 14,
+    fontWeight: 400,
+    color: "#1a1a2e",
+    background: "#ffffff",
+    primary: "#6366f1",
+    primaryHover: "#4f46e5",
+    secondary: "#64748b",
+    success: "#22c55e",
+    warning: "#f59e0b",
+    error: "#ef4444",
+    info: "#3b82f6",
+    borderColor: "#e2e8f0",
+    borderRadius: 8,
+    spacing: 8,
+    inputBg: "#ffffff",
+    inputBorder: "#cbd5e1",
+    disabledBg: "#f1f5f9",
+    disabledColor: "#94a3b8",
+    cardBg: "#ffffff",
+    cardShadow: "rgba(0,0,0,0.08)",
+    modalOverlay: "rgba(0,0,0,0.5)",
+    tooltipBg: "#1e293b",
+    tooltipColor: "#f8fafc"
+};
+
+function getTheme() { return _theme; }
+function setTheme(overrides) {
+    let keys = Object.keys(overrides);
+    for (let i = 0; i < keys.length; i++) {
+        _theme[keys[i]] = overrides[keys[i]];
+    }
+}
+
+// ============================================================================
+// Component Registry
+// ============================================================================
+
+let _componentRenderers = {};
+
+function registerComponent(name, renderFn) {
+    _componentRenderers[name] = renderFn;
+}
+
+// ============================================================================
+// Style defaults by component type
+// ============================================================================
+
+let _defaultStyles = {};
+
+function registerDefaultStyle(componentType, style) {
+    _defaultStyles[componentType] = style;
+}
+
+// ============================================================================
+// Component tree node structure
+// ============================================================================
+// A component node:
+// {
+//   type: string,          // e.g. "Box", "Text", "Button"
+//   props: {},             // component-specific properties
+//   style: {},             // CSS-like style properties
+//   children: [],          // child component nodes
+//   layoutNode: number,    // taffy node handle (set during layout phase)
+//   _computedLayout: null  // {x, y, width, height} after layout
+// }
+
+// Create a component node
+function createNode(type, props, style, children) {
+    return {
+        type: type || "Box",
+        props: props || {},
+        style: style || {},
+        children: children || [],
+        layoutNode: 0,
+        _computedLayout: null,
+        _parentX: 0,
+        _parentY: 0
+    };
+}
+
+// ============================================================================
+// Style resolution
+// ============================================================================
+
+// Merge style from: defaults -> component defaults -> inline style -> props
+function resolveStyle(node) {
+    let base = {
+        display: "flex",
+        flexDirection: "column",
+        position: "relative",
+        overflow: "visible",
+        flexWrap: "nowrap",
+        justifyContent: "flex-start",
+        alignItems: "stretch",
+        alignContent: "flex-start",
+        alignSelf: "auto",
+        flexGrow: 0,
+        flexShrink: 1,
+        flexBasis: "auto",
+        width: "auto",
+        height: "auto",
+        minWidth: "auto",
+        minHeight: "auto",
+        maxWidth: "auto",
+        maxHeight: "auto",
+        paddingTop: 0,
+        paddingRight: 0,
+        paddingBottom: 0,
+        paddingLeft: 0,
+        marginTop: 0,
+        marginRight: 0,
+        marginBottom: 0,
+        marginLeft: 0,
+        borderTopWidth: 0,
+        borderRightWidth: 0,
+        borderBottomWidth: 0,
+        borderLeftWidth: 0,
+        gapRow: 0,
+        gapColumn: 0,
+        top: "auto",
+        right: "auto",
+        bottom: "auto",
+        left: "auto",
+        aspectRatio: null,
+        order: 0,
+        zIndex: 0
+    };
+
+    // Apply component type defaults
+    let typeDef = _defaultStyles[node.type];
+    if (typeDef) {
+        let keys = Object.keys(typeDef);
+        for (let i = 0; i < keys.length; i++) {
+            base[keys[i]] = typeDef[keys[i]];
+        }
+    }
+
+    // Apply inline style
+    let nodeStyle = node.style;
+    if (nodeStyle) {
+        let skeys = Object.keys(nodeStyle);
+        for (let i = 0; i < skeys.length; i++) {
+            let key = skeys[i];
+            let val = nodeStyle[key];
+
+            // Handle shorthand properties
+            if (key === "padding") {
+                let p = _parseSpacing(val);
+                base.paddingTop = p[0];
+                base.paddingRight = p[1];
+                base.paddingBottom = p[2];
+                base.paddingLeft = p[3];
+            } else if (key === "margin") {
+                let m = _parseSpacing(val);
+                base.marginTop = m[0];
+                base.marginRight = m[1];
+                base.marginBottom = m[2];
+                base.marginLeft = m[3];
+            } else if (key === "borderWidth") {
+                base.borderTopWidth = val;
+                base.borderRightWidth = val;
+                base.borderBottomWidth = val;
+                base.borderLeftWidth = val;
+            } else if (key === "gap") {
+                base.gapRow = val;
+                base.gapColumn = val;
+            } else if (key === "inset") {
+                let ins = _parseSpacing(val);
+                base.top = ins[0];
+                base.right = ins[1];
+                base.bottom = ins[2];
+                base.left = ins[3];
+            } else {
+                base[key] = val;
+            }
+        }
+    }
+
+    return base;
+}
+
+// Parse a spacing shorthand (like CSS margin/padding)
+// Can be: number, [top, right, bottom, left], [vertical, horizontal], [all]
+function _parseSpacing(val) {
+    if (typeof val === "number") {
+        return [val, val, val, val];
+    }
+    if (Array.isArray(val)) {
+        if (val.length === 1) return [val[0], val[0], val[0], val[0]];
+        if (val.length === 2) return [val[0], val[1], val[0], val[1]];
+        if (val.length === 3) return [val[0], val[1], val[2], val[1]];
+        if (val.length >= 4) return [val[0], val[1], val[2], val[3]];
+    }
+    return [0, 0, 0, 0];
+}
+
+// Convert resolved style to a layout bridge style object
+function _styleToLayoutStyle(s) {
+    return {
+        display: s.display || "flex",
+        position: s.position || "relative",
+        overflow: s.overflow || "visible",
+        flexDirection: s.flexDirection || "column",
+        flexWrap: s.flexWrap || "nowrap",
+        justifyContent: s.justifyContent || "flex-start",
+        alignItems: s.alignItems || "stretch",
+        alignContent: s.alignContent || "flex-start",
+        alignSelf: s.alignSelf || "auto",
+        flexGrow: s.flexGrow || 0,
+        flexShrink: s.flexShrink !== undefined ? s.flexShrink : 1,
+        flexBasis: _dimValue(s.flexBasis),
+        width: _dimValue(s.width),
+        height: _dimValue(s.height),
+        minWidth: _dimValue(s.minWidth),
+        minHeight: _dimValue(s.minHeight),
+        maxWidth: _dimValue(s.maxWidth),
+        maxHeight: _dimValue(s.maxHeight),
+        padding: [
+            s.paddingTop || 0,
+            s.paddingRight || 0,
+            s.paddingBottom || 0,
+            s.paddingLeft || 0
+        ],
+        margin: [
+            _dimValue(s.marginTop),
+            _dimValue(s.marginRight),
+            _dimValue(s.marginBottom),
+            _dimValue(s.marginLeft)
+        ],
+        border: [
+            s.borderTopWidth || 0,
+            s.borderRightWidth || 0,
+            s.borderBottomWidth || 0,
+            s.borderLeftWidth || 0
+        ],
+        inset: [
+            _dimValue(s.top),
+            _dimValue(s.right),
+            _dimValue(s.bottom),
+            _dimValue(s.left)
+        ],
+        gap: [s.gapRow || 0, s.gapColumn || 0],
+        aspectRatio: s.aspectRatio,
+        order: s.order || 0,
+        zIndex: s.zIndex || 0,
+        gridTemplateColumns: s.gridTemplateColumns || [],
+        gridTemplateRows: s.gridTemplateRows || [],
+        gridColumnStart: s.gridColumnStart || "auto",
+        gridColumnEnd: s.gridColumnEnd || "auto",
+        gridRowStart: s.gridRowStart || "auto",
+        gridRowEnd: s.gridRowEnd || "auto"
+    };
+}
+
+// Convert a dimension value to a layout bridge dimension spec
+// "auto" -> {type: "auto"}
+// number -> {type: "points", value: n}
+// "50%" -> {type: "percent", value: 50}
+function _dimValue(val) {
+    if (val === undefined || val === null || val === "auto") {
+        return { type: "auto" };
+    }
+    if (typeof val === "number") {
+        return { type: "points", value: val };
+    }
+    if (typeof val === "string") {
+        if (val.indexOf("%") >= 0) {
+            let pct = parseFloat(val);
+            if (!isNaN(pct)) {
+                return { type: "percent", value: pct };
+            }
+        }
+        let num = parseFloat(val);
+        if (!isNaN(num)) {
+            return { type: "points", value: num };
+        }
+    }
+    return { type: "auto" };
+}
+
+// ============================================================================
+// Layout phase — create taffy nodes for the tree
+// ============================================================================
+
+function buildLayout(node) {
+    let resolved = resolveStyle(node);
+    node._resolvedStyle = resolved;
+
+    // Special handling for text nodes: measure text to set intrinsic size
+    if (node.type === "Text" || node.type === "Heading") {
+        _measureTextNode(node, resolved);
+    }
+
+    let layoutStyle = _styleToLayoutStyle(resolved);
+    node.layoutNode = layout.createNode(layoutStyle);
+
+    // Recursively build children
+    let childNodes = [];
+    let childCount = node.children.length;
+    for (let i = 0; i < childCount; i++) {
+        let child = node.children[i];
+        buildLayout(child);
+        childNodes.push(child.layoutNode);
+    }
+
+    if (childNodes.length > 0) {
+        layout.setChildren(node.layoutNode, childNodes);
+    }
+
+    return node;
+}
+
+function _measureTextNode(node, resolved) {
+    let text = node.props.text || node.props.value || "";
+    if (text === "") return;
+
+    let fontSize = node.props.fontSize || resolved.fontSize || _theme.fontSize;
+    let fontWeight = node.props.fontWeight || resolved.fontWeight || _theme.fontWeight;
+    let fontFamily = node.props.fontFamily || _theme.fontFamily;
+    let maxWidth = 0;
+
+    // If width is set, use it as max width for text measurement
+    if (resolved.width && resolved.width !== "auto" && typeof resolved.width === "number") {
+        maxWidth = resolved.width - (resolved.paddingLeft || 0) - (resolved.paddingRight || 0);
+    }
+
+    let measured = draw.measureText(text, fontSize, fontWeight, fontFamily, maxWidth);
+    if (measured) {
+        // Only set size if not explicitly specified
+        if (resolved.width === "auto" || resolved.width === undefined) {
+            node.style._measuredWidth = measured.width + (resolved.paddingLeft || 0) + (resolved.paddingRight || 0);
+        }
+        if (resolved.height === "auto" || resolved.height === undefined) {
+            node.style._measuredHeight = measured.height + (resolved.paddingTop || 0) + (resolved.paddingBottom || 0);
+        }
+    }
+}
+
+// ============================================================================
+// Compute layout
+// ============================================================================
+
+function computeLayout(rootNode, availWidth, availHeight) {
+    layout.computeLayout(rootNode.layoutNode, availWidth, availHeight);
+    _collectLayouts(rootNode, 0, 0);
+}
+
+function _collectLayouts(node, parentX, parentY) {
+    let l = layout.getLayout(node.layoutNode);
+    node._computedLayout = {
+        x: l.x + parentX,
+        y: l.y + parentY,
+        width: l.width,
+        height: l.height,
+        localX: l.x,
+        localY: l.y
+    };
+    node._parentX = parentX;
+    node._parentY = parentY;
+
+    let absX = node._computedLayout.x;
+    let absY = node._computedLayout.y;
+
+    // For absolute/fixed positioned children, they position relative to this node
+    for (let i = 0; i < node.children.length; i++) {
+        let child = node.children[i];
+        let pos = child._resolvedStyle ? child._resolvedStyle.position : "relative";
+        if (pos === "absolute" || pos === "fixed") {
+            _collectLayouts(child, absX, absY);
+        } else {
+            _collectLayouts(child, absX, absY);
+        }
+    }
+}
+
+// ============================================================================
+// Render phase — draw components
+// ============================================================================
+
+function renderTree(node) {
+    if (!node || !node._computedLayout) return;
+
+    let cl = node._computedLayout;
+
+    // Skip if zero-size or display:none
+    if (node._resolvedStyle && node._resolvedStyle.display === "none") return;
+    if (cl.width <= 0 && cl.height <= 0) return;
+
+    // Clear per-frame flags
+    node._childrenRendered = false;
+    node._animTransformPushed = false;
+    node._animOpacityPushed = false;
+    node._dragTransformPushed = false;
+
+    // Look up and call the component renderer
+    let renderer = _componentRenderers[node.type];
+    if (renderer) {
+        renderer(node, cl);
+    }
+
+    // If the component already rendered its children (Marquee, Collapse, etc.), skip
+    if (!node._childrenRendered) {
+        // Sort children by z-index and render
+        let children = node.children;
+        if (children.length > 0) {
+            // Clip if overflow hidden/scroll
+            let needsClip = false;
+            if (node._resolvedStyle) {
+                let ov = node._resolvedStyle.overflow;
+                if (ov === "hidden" || ov === "scroll") {
+                    needsClip = true;
+                    let br = node.props.borderRadius || node._resolvedStyle.borderRadius || 0;
+                    draw.pushClip(cl.x, cl.y, cl.width, cl.height, br);
+                }
+            }
+
+            // Sort by z-index (stable)
+            let sorted = _sortByZIndex(children);
+            for (let i = 0; i < sorted.length; i++) {
+                renderTree(sorted[i]);
+            }
+
+            if (needsClip) {
+                draw.popClip();
+            }
+        }
+    }
+
+    // Pop any transforms/opacity pushed by the component renderer
+    if (node._animOpacityPushed) {
+        draw.popOpacity();
+    }
+    if (node._animTransformPushed) {
+        draw.popTransform();
+    }
+    if (node._dragTransformPushed) {
+        draw.popTransform();
+    }
+}
+
+function _sortByZIndex(children) {
+    if (children.length <= 1) return children;
+    // Check if any child has non-zero z-index
+    let needsSort = false;
+    for (let i = 0; i < children.length; i++) {
+        let z = children[i]._resolvedStyle ? (children[i]._resolvedStyle.zIndex || 0) : 0;
+        if (z !== 0) { needsSort = true; break; }
+    }
+    if (!needsSort) return children;
+
+    // Simple insertion sort (stable) on z-index
+    let arr = [];
+    for (let i = 0; i < children.length; i++) arr.push(children[i]);
+    for (let i = 1; i < arr.length; i++) {
+        let key = arr[i];
+        let keyZ = key._resolvedStyle ? (key._resolvedStyle.zIndex || 0) : 0;
+        let j = i - 1;
+        while (j >= 0) {
+            let jZ = arr[j]._resolvedStyle ? (arr[j]._resolvedStyle.zIndex || 0) : 0;
+            if (jZ > keyZ) {
+                arr[j + 1] = arr[j];
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        arr[j + 1] = key;
+    }
+    return arr;
+}
+
+// ============================================================================
+// Full render pipeline
+// ============================================================================
+
+// _rootNode: the component tree root (built by the app or UI parser)
+let _rootNode = null;
+let _needsRebuild = true;
+let _builderFn = null;
+
+function setRootNode(node) {
+    _rootNode = node;
+    _needsRebuild = true;
+}
+
+function getRootNode() {
+    return _rootNode;
+}
+
+// Register a builder function that will be called every frame to rebuild the UI.
+// This enables reactivity: when state changes, the UI tree is automatically rebuilt.
+function setBuilderFn(fn) {
+    _builderFn = fn;
+}
+
+// Main render function — called by the host each frame
+function _render() {
+    let vw = draw.getViewportWidth();
+    let vh = draw.getViewportHeight();
+    if (vw <= 0 || vh <= 0) return;
+
+    // If a builder function is registered, rebuild the tree every frame
+    if (_builderFn) {
+        _rootNode = _builderFn();
+        _needsRebuild = true;
+    }
+
+    if (!_rootNode) return;
+
+    // Dispatch input events
+    _dispatchEvents();
+
+    // Clear with background color
+    draw.rect(0, 0, vw, vh, _theme.background, 0, 0, "", 1);
+
+    // Rebuild layout if needed
+    if (_needsRebuild) {
+        layout.clear();
+        buildLayout(_rootNode);
+        _needsRebuild = false;
+    }
+
+    // Compute layout
+    computeLayout(_rootNode, vw, vh);
+
+    // Render
+    renderTree(_rootNode);
+}
+
+// Request a re-render (marks tree as needing layout rebuild)
+function invalidate() {
+    _needsRebuild = true;
+    input.requestRedraw();
+}
+
+// Request redraw without full layout rebuild (e.g. for animations)
+function requestRedraw() {
+    input.requestRedraw();
+}
+
+// ============================================================================
+// Hit testing
+// ============================================================================
+
+function hitTest(node, x, y) {
+    if (!node || !node._computedLayout) return null;
+    let cl = node._computedLayout;
+
+    // Check children in reverse z-order (top-most first)
+    let children = _sortByZIndex(node.children);
+    for (let i = children.length - 1; i >= 0; i--) {
+        let hit = hitTest(children[i], x, y);
+        if (hit) return hit;
+    }
+
+    // Check this node
+    if (x >= cl.x && x < cl.x + cl.width && y >= cl.y && y < cl.y + cl.height) {
+        return node;
+    }
+    return null;
+}
+
+// ============================================================================
+// State management helpers
+// ============================================================================
+
+let _state = {};
+
+function setState(key, value) {
+    _state[key] = value;
+    invalidate();
+}
+
+function getState(key, defaultValue) {
+    if (_state[key] !== undefined) return _state[key];
+    return defaultValue;
+}
+
+// ============================================================================
+// Import color utilities and component renderers
+// These must come AFTER all core definitions (registerComponent, _theme,
+// renderTree, getState, setState, etc.) since component files call them
+// at top level during import.
+// ============================================================================
+
+// ============================================================================
+// softn-formlogic stdlib: color.logic
+// Color parsing and manipulation utilities
+// ============================================================================
+
+// Named CSS colors (subset)
+let _namedColors = {
+    "white": [255, 255, 255, 1],
+    "black": [0, 0, 0, 1],
+    "red": [255, 0, 0, 1],
+    "green": [0, 128, 0, 1],
+    "blue": [0, 0, 255, 1],
+    "yellow": [255, 255, 0, 1],
+    "orange": [255, 165, 0, 1],
+    "purple": [128, 0, 128, 1],
+    "pink": [255, 192, 203, 1],
+    "cyan": [0, 255, 255, 1],
+    "gray": [128, 128, 128, 1],
+    "grey": [128, 128, 128, 1],
+    "transparent": [0, 0, 0, 0],
+    "coral": [255, 127, 80, 1],
+    "crimson": [220, 20, 60, 1],
+    "navy": [0, 0, 128, 1],
+    "teal": [0, 128, 128, 1],
+    "olive": [128, 128, 0, 1],
+    "maroon": [128, 0, 0, 1],
+    "indigo": [75, 0, 130, 1],
+    "violet": [238, 130, 238, 1],
+    "gold": [255, 215, 0, 1],
+    "silver": [192, 192, 192, 1],
+    "brown": [165, 42, 42, 1],
+    "tan": [210, 180, 140, 1],
+    "salmon": [250, 128, 114, 1],
+    "tomato": [255, 99, 71, 1],
+    "lime": [0, 255, 0, 1],
+    "aqua": [0, 255, 255, 1],
+    "skyblue": [135, 206, 235, 1],
+    "steelblue": [70, 130, 180, 1],
+    "slategray": [112, 128, 144, 1],
+    "darkgray": [169, 169, 169, 1],
+    "lightgray": [211, 211, 211, 1],
+    "whitesmoke": [245, 245, 245, 1],
+    "beige": [245, 245, 220, 1],
+    "ivory": [255, 255, 240, 1],
+    "linen": [250, 240, 230, 1],
+    "snow": [255, 250, 250, 1],
+    "honeydew": [240, 255, 240, 1],
+    "mintcream": [245, 255, 250, 1],
+    "aliceblue": [240, 248, 255, 1],
+    "ghostwhite": [248, 248, 255, 1],
+    "seashell": [255, 245, 238, 1],
+    "lavender": [230, 230, 250, 1],
+    "cornflowerblue": [100, 149, 237, 1],
+    "dodgerblue": [30, 144, 255, 1],
+    "royalblue": [65, 105, 225, 1],
+    "mediumblue": [0, 0, 205, 1],
+    "darkblue": [0, 0, 139, 1],
+    "midnightblue": [25, 25, 112, 1],
+    "darkgreen": [0, 100, 0, 1],
+    "forestgreen": [34, 139, 34, 1],
+    "limegreen": [50, 205, 50, 1],
+    "springgreen": [0, 255, 127, 1],
+    "darkred": [139, 0, 0, 1],
+    "firebrick": [178, 34, 34, 1],
+    "orangered": [255, 69, 0, 1],
+    "darkorange": [255, 140, 0, 1],
+    "deeppink": [255, 20, 147, 1],
+    "hotpink": [255, 105, 180, 1],
+    "mediumorchid": [186, 85, 211, 1],
+    "darkorchid": [153, 50, 204, 1],
+    "darkviolet": [148, 0, 211, 1],
+    "blueviolet": [138, 43, 226, 1]
+};
+
+// Parse a single hex digit
+function _hexVal(c) {
+    if (c >= 48 && c <= 57) return c - 48;        // '0'-'9'
+    if (c >= 97 && c <= 102) return c - 97 + 10;   // 'a'-'f'
+    if (c >= 65 && c <= 70) return c - 65 + 10;     // 'A'-'F'
+    return 0;
+}
+
+// Parse a color string to [r, g, b, a] where r,g,b are 0-255 and a is 0-1
+function parseColor(s) {
+    if (s === undefined || s === null || s === "" || s === "none") {
+        return [0, 0, 0, 0];
+    }
+    s = s.trim();
+
+    // Named color lookup
+    let lower = s.toLowerCase();
+    if (_namedColors[lower] !== undefined) {
+        return _namedColors[lower];
+    }
+
+    // Hex color
+    if (s[0] === "#") {
+        let hex = s.slice(1);
+        if (hex.length === 3) {
+            let r = _hexVal(hex.charCodeAt(0)) * 17;
+            let g = _hexVal(hex.charCodeAt(1)) * 17;
+            let b = _hexVal(hex.charCodeAt(2)) * 17;
+            return [r, g, b, 1];
+        }
+        if (hex.length === 6) {
+            let r = _hexVal(hex.charCodeAt(0)) * 16 + _hexVal(hex.charCodeAt(1));
+            let g = _hexVal(hex.charCodeAt(2)) * 16 + _hexVal(hex.charCodeAt(3));
+            let b = _hexVal(hex.charCodeAt(4)) * 16 + _hexVal(hex.charCodeAt(5));
+            return [r, g, b, 1];
+        }
+        if (hex.length === 8) {
+            let r = _hexVal(hex.charCodeAt(0)) * 16 + _hexVal(hex.charCodeAt(1));
+            let g = _hexVal(hex.charCodeAt(2)) * 16 + _hexVal(hex.charCodeAt(3));
+            let b = _hexVal(hex.charCodeAt(4)) * 16 + _hexVal(hex.charCodeAt(5));
+            let a = _hexVal(hex.charCodeAt(6)) * 16 + _hexVal(hex.charCodeAt(7));
+            return [r, g, b, a / 255];
+        }
+    }
+
+    // rgb() / rgba()
+    if (s.indexOf("rgb") === 0) {
+        let start = s.indexOf("(");
+        let end = s.lastIndexOf(")");
+        if (start >= 0 && end > start) {
+            let inner = s.slice(start + 1, end);
+            let parts = inner.split(",");
+            let r = Math.round(parseFloat(parts[0] || "0"));
+            let g = Math.round(parseFloat(parts[1] || "0"));
+            let b = Math.round(parseFloat(parts[2] || "0"));
+            let a = parts.length > 3 ? parseFloat(parts[3] || "1") : 1;
+            return [
+                Math.max(0, Math.min(255, r)),
+                Math.max(0, Math.min(255, g)),
+                Math.max(0, Math.min(255, b)),
+                Math.max(0, Math.min(1, a))
+            ];
+        }
+    }
+
+    // Fallback: black
+    return [0, 0, 0, 1];
+}
+
+// Convert [r,g,b,a] to a CSS-style color string for the draw bridge
+function colorToString(rgba) {
+    if (rgba[3] < 1) {
+        return `rgba(${rgba[0]},${rgba[1]},${rgba[2]},${rgba[3]})`;
+    }
+    let r = rgba[0].toString(16);
+    let g = rgba[1].toString(16);
+    let b = rgba[2].toString(16);
+    if (r.length < 2) r = "0" + r;
+    if (g.length < 2) g = "0" + g;
+    if (b.length < 2) b = "0" + b;
+    return "#" + r + g + b;
+}
+
+// Lighten a color by a factor (0-1)
+function lightenColor(colorStr, factor) {
+    let c = parseColor(colorStr);
+    let r = Math.min(255, Math.round(c[0] + (255 - c[0]) * factor));
+    let g = Math.min(255, Math.round(c[1] + (255 - c[1]) * factor));
+    let b = Math.min(255, Math.round(c[2] + (255 - c[2]) * factor));
+    return colorToString([r, g, b, c[3]]);
+}
+
+// Darken a color by a factor (0-1)
+function darkenColor(colorStr, factor) {
+    let c = parseColor(colorStr);
+    let r = Math.max(0, Math.round(c[0] * (1 - factor)));
+    let g = Math.max(0, Math.round(c[1] * (1 - factor)));
+    let b = Math.max(0, Math.round(c[2] * (1 - factor)));
+    return colorToString([r, g, b, c[3]]);
+}
+
+// Set alpha on a color
+function withAlpha(colorStr, alpha) {
+    let c = parseColor(colorStr);
+    return `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+}
+
+// ============================================================================
+// Component Index — imports all component registration files
+// ============================================================================
+// Import order: foundational types first, then more complex ones.
+
+// ============================================================================
+// Layout Components: Box, Stack, Card, Grid, Divider, Spacer, Center,
+//                    Container, Header, Sidebar, Section, Split, Layout, Content
+// ============================================================================
+
+// ─── Box ────────────────────────────────────────────────────────────────────
+// The most versatile component: a div with full flexbox control, background
+// (solid/gradient), border, border-radius, box-shadow, opacity, transforms.
+registerComponent("Box", (node, cl) => {
+    let p = node.props;
+    let s = node._resolvedStyle;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let opacity = p.opacity !== undefined ? p.opacity : 1;
+    if (p.visible === false) return;
+
+    // Box shadow (rendered before the box)
+    if (p.boxShadow) {
+        let sh = p.boxShadow;
+        let ox = sh.offsetX || 0;
+        let oy = sh.offsetY || 0;
+        let blur = sh.blur || 0;
+        let spread = sh.spread || 0;
+        let sc = sh.color || "rgba(0,0,0,0.3)";
+        let br = p.borderRadius || s.borderRadius || 0;
+
+        if (blur > 0) {
+            let layers = Math.max(1, Math.ceil(blur / 2));
+            for (let i = layers - 1; i >= 0; i--) {
+                let expand = (i + 1) * (blur / layers) + spread;
+                let a = (1 - i / layers) * 0.15;
+                let shadowColor = withAlpha(sc, a);
+                draw.roundedRect(
+                    x + ox - expand, y + oy - expand,
+                    w + expand * 2, h + expand * 2,
+                    shadowColor, br + expand, 0, "", opacity
+                );
+            }
+        } else if (spread > 0) {
+            draw.roundedRect(
+                x + ox - spread, y + oy - spread,
+                w + spread * 2, h + spread * 2,
+                sc, (p.borderRadius || 0) + spread, 0, "", opacity
+            );
+        }
+    }
+
+    // Background
+    let bg = p.background || s.background;
+    let br = p.borderRadius || s.borderRadius || 0;
+    if (p.borderRadiusPct) {
+        br = Math.min(w, h) * br / 100;
+    }
+
+    if (bg && bg !== "transparent") {
+        if (typeof bg === "object" && bg.type === "linearGradient") {
+            let angle = bg.angle || 0;
+            draw.linearGradient(x, y, w, h, angle, bg.stops || [], br, opacity);
+        } else if (typeof bg === "object" && bg.type === "radialGradient") {
+            draw.radialGradient(x, y, w, h, bg.stops || [], br, opacity);
+        } else {
+            draw.roundedRect(x, y, w, h, bg, br, 0, "", opacity);
+        }
+    }
+
+    // Border
+    let bw = p.borderWidth || s.borderTopWidth || 0;
+    let bc = p.borderColor || s.borderColor;
+    if (bw > 0 && bc) {
+        draw.roundedRect(x, y, w, h, "", br, bw, bc, opacity);
+    }
+});
+
+// ─── Stack ──────────────────────────────────────────────────────────────────
+// Simplified Box with mandatory direction semantics. Vertical or Horizontal.
+registerComponent("Stack", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.roundedRect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Card ───────────────────────────────────────────────────────────────────
+// Rounded-rect container with variant-based styling, optional title/subtitle.
+registerComponent("Card", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let variant = p.variant || "default";
+
+    // Variant defaults
+    let bg = p.background;
+    let bc = p.borderColor;
+    let bw = p.borderWidth;
+    let br = p.borderRadius !== undefined ? p.borderRadius : 12;
+
+    if (bg === undefined) {
+        if (variant === "outlined") { bg = "transparent"; }
+        else if (variant === "elevated") { bg = "#16161a"; }
+        else if (variant === "filled") { bg = "#1e1e23"; }
+        else if (variant === "ghost") { bg = "transparent"; }
+        else if (variant === "glass") { bg = "rgba(255,255,255,0.05)"; }
+        else if (variant === "gradient") { bg = "#6366f1"; }
+        else { bg = "#16161a"; }
+    }
+    if (bc === undefined) {
+        if (variant === "outlined") { bc = "#52525b"; }
+        else if (variant === "elevated" || variant === "gradient" || variant === "ghost") { bc = "transparent"; }
+        else if (variant === "glass") { bc = "rgba(255,255,255,0.1)"; }
+        else { bc = "rgba(255,255,255,0.08)"; }
+    }
+    if (bw === undefined) {
+        if (variant === "elevated" || variant === "gradient" || variant === "ghost") { bw = 0; }
+        else { bw = 1; }
+    }
+
+    // Selected override
+    if (p.selected) {
+        bc = "#6366f1";
+        if (bw < 2) bw = 2;
+    }
+
+    // Draw card background
+    if (bg && bg !== "transparent") {
+        draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+    }
+
+    // Border
+    if (bw > 0 && bc && bc !== "transparent") {
+        draw.roundedRect(x, y, w, h, "", br, bw, bc, 1);
+    }
+
+    // Title
+    let padding = p.padding || 16;
+    if (p.title) {
+        draw.text(p.title, x + padding, y + padding, 18, 600, "#fafafa",
+            _theme.fontFamily, w - padding * 2, 1);
+    }
+    // Subtitle
+    if (p.subtitle) {
+        let titleOffset = p.title ? 24 : 0;
+        draw.text(p.subtitle, x + padding, y + padding + titleOffset, 14, 400, "#a1a1aa",
+            _theme.fontFamily, w - padding * 2, 1);
+    }
+});
+
+// ─── Grid ───────────────────────────────────────────────────────────────────
+// CSS Grid container (columns of equal width).
+registerComponent("Grid", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Divider ────────────────────────────────────────────────────────────────
+// Horizontal line separator.
+registerComponent("Divider", (node, cl) => {
+    let p = node.props;
+    let color = p.color || "rgba(255,255,255,0.2)";
+    let thickness = p.thickness || 1;
+    draw.rect(cl.x, cl.y, cl.width, thickness, color, 0, 0, "", 1);
+});
+
+// ─── Spacer ─────────────────────────────────────────────────────────────────
+// Invisible spacing element. Renders nothing.
+registerComponent("Spacer", (node, cl) => {
+    // No visual rendering — purely a layout tool.
+});
+
+// ─── Center ─────────────────────────────────────────────────────────────────
+// Centers children both horizontally and vertically.
+registerComponent("Center", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Container ──────────────────────────────────────────────────────────────
+// Centered column with maxWidth, like Bootstrap's .container.
+registerComponent("Container", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Header ─────────────────────────────────────────────────────────────────
+// Fixed-height horizontal bar with optional bottom border.
+registerComponent("Header", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    // Bottom border
+    let borderBottom = p.borderBottom !== undefined ? p.borderBottom : true;
+    if (borderBottom) {
+        let bc = p.borderColor || "rgba(255,255,255,0.1)";
+        draw.line(x, y + h, x + w, y + h, bc, 1);
+    }
+});
+
+// ─── Sidebar ────────────────────────────────────────────────────────────────
+// Fixed-width vertical column with optional right border.
+registerComponent("Sidebar", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    // Right border
+    let borderRight = p.borderRight !== undefined ? p.borderRight : true;
+    if (borderRight) {
+        let bc = p.borderColor || "rgba(255,255,255,0.1)";
+        draw.line(x + w, y, x + w, y + h, bc, 1);
+    }
+});
+
+// ─── Section ────────────────────────────────────────────────────────────────
+// Vertical stack with optional title and 12px gap.
+registerComponent("Section", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Split ──────────────────────────────────────────────────────────────────
+// Splits space between children by a ratio.
+registerComponent("Split", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Layout ─────────────────────────────────────────────────────────────────
+// Full-page layout shell (100% x 100%). Contains Header, Sidebar, Content.
+registerComponent("Layout", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Content ────────────────────────────────────────────────────────────────
+// Main scrollable content area within a Layout. flex:1, overflow-y:scroll.
+registerComponent("Content", (node, cl) => {
+    let p = node.props;
+    let bg = p.background;
+    if (bg && bg !== "transparent") {
+        draw.rect(cl.x, cl.y, cl.width, cl.height, bg, 0, 0, "", 1);
+    }
+});
+
+// ─── Default styles for layout components ──────────────────────────────────
+
+registerDefaultStyle("Box", {
+    display: "flex",
+    flexDirection: "column"
+});
+
+registerDefaultStyle("Stack", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%"
+});
+
+registerDefaultStyle("Card", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    overflow: "hidden",
+    padding: 16
+});
+
+registerDefaultStyle("Grid", {
+    display: "grid",
+    width: "100%"
+});
+
+registerDefaultStyle("Divider", {
+    width: "100%",
+    height: 1,
+    marginTop: 4,
+    marginBottom: 4,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Spacer", {
+    flexGrow: 1
+});
+
+registerDefaultStyle("Center", {
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    width: "100%",
+    height: "100%"
+});
+
+registerDefaultStyle("Container", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    maxWidth: 1200,
+    marginLeft: "auto",
+    marginRight: "auto",
+    padding: 16
+});
+
+registerDefaultStyle("Header", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    width: "100%",
+    height: 56,
+    padding: 16,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Sidebar", {
+    display: "flex",
+    flexDirection: "column",
+    width: 240,
+    height: "100%",
+    flexShrink: 0
+});
+
+registerDefaultStyle("Section", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    padding: 16,
+    gapRow: 12
+});
+
+registerDefaultStyle("Split", {
+    display: "flex",
+    flexDirection: "row",
+    width: "100%",
+    height: "100%"
+});
+
+registerDefaultStyle("Layout", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    height: "100%"
+});
+
+registerDefaultStyle("Content", {
+    display: "flex",
+    flexDirection: "column",
+    flexGrow: 1,
+    padding: 16,
+    overflow: "hidden"
+});
+
+// ============================================================================
+// Text Components: Text, Heading
+// ============================================================================
+
+// ─── Text ───────────────────────────────────────────────────────────────────
+// Pure text rendering with variant-based colors, transforms, decorations.
+registerComponent("Text", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let text = p.text || p.value || "";
+    if (text === "") return;
+
+    // Text transform
+    let transform = p.transform || "none";
+    if (transform === "uppercase") text = text.toUpperCase();
+    else if (transform === "lowercase") text = text.toLowerCase();
+    else if (transform === "capitalize") {
+        text = text.split(" ").map(word => {
+            if (word.length === 0) return word;
+            return word[0].toUpperCase() + word.slice(1);
+        }).join(" ");
+    }
+
+    // Variant-based color defaults
+    let color = p.color;
+    if (!color) {
+        let variant = p.variant || "default";
+        if (variant === "muted") color = "#a1a1aa";
+        else if (variant === "primary") color = "#6366f1";
+        else if (variant === "secondary") color = "#a1a1aa";
+        else if (variant === "success") color = "#22c55e";
+        else if (variant === "warning") color = "#f59e0b";
+        else if (variant === "error") color = "#ef4444";
+        else if (variant === "info") color = "#3b82f6";
+        else color = _theme.color;
+    }
+
+    let fontSize = p.fontSize || _theme.fontSize;
+    let fontWeight = p.fontWeight || _theme.fontWeight;
+    let fontFamily = p.fontFamily || _theme.fontFamily;
+    let opacity = p.opacity !== undefined ? p.opacity : 1;
+
+    // Padding offsets
+    let s = node._resolvedStyle;
+    let px = (s.paddingLeft || 0);
+    let py = (s.paddingTop || 0);
+
+    draw.text(text, x + px, y + py, fontSize, fontWeight, color,
+        fontFamily, w - px - (s.paddingRight || 0), opacity);
+});
+
+// ─── Heading ────────────────────────────────────────────────────────────────
+// Header text with level-based sizing (h1-h6).
+registerComponent("Heading", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+
+    let text = p.text || p.value || "";
+    if (text === "") return;
+
+    let level = p.level || 1;
+
+    // Level-based defaults
+    let fontSize = p.fontSize;
+    let fontWeight = p.fontWeight;
+    if (!fontSize) {
+        if (level === 1) fontSize = 36;
+        else if (level === 2) fontSize = 30;
+        else if (level === 3) fontSize = 24;
+        else if (level === 4) fontSize = 20;
+        else if (level === 5) fontSize = 18;
+        else fontSize = 16;
+    }
+    if (!fontWeight) {
+        if (level <= 2) fontWeight = 700;
+        else fontWeight = 600;
+    }
+
+    // Variant-based color
+    let color = p.color;
+    if (!color) {
+        let variant = p.variant || "default";
+        if (variant === "muted") color = "#a1a1aa";
+        else if (variant === "primary" || variant === "gradient") color = "#6366f1";
+        else color = _theme.color;
+    }
+
+    let fontFamily = p.fontFamily || _theme.fontFamily;
+    let opacity = p.opacity !== undefined ? p.opacity : 1;
+
+    let s = node._resolvedStyle;
+    let px = (s.paddingLeft || 0);
+    let py = (s.paddingTop || 0);
+
+    draw.text(text, x + px, y + py, fontSize, fontWeight, color,
+        fontFamily, w - px - (s.paddingRight || 0), opacity);
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Text", {
+    flexShrink: 1
+});
+
+registerDefaultStyle("Heading", {
+    flexShrink: 0
+});
+
+// ============================================================================
+// Input/Form Components: Button, Input, TextArea, Select, Switch, Checkbox,
+//                        Radio, Slider
+// ============================================================================
+
+// ─── Button ─────────────────────────────────────────────────────────────────
+registerComponent("Button", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let variant = p.variant || "primary";
+    let disabled = p.disabled || p.loading;
+    let opacity = disabled ? 0.5 : 1;
+
+    let bg = p.background || _theme.primary;
+    let fg = p.color || "#ffffff";
+    let br = p.borderRadius !== undefined ? p.borderRadius : _theme.borderRadius;
+    let bw = p.borderWidth || 0;
+    let bc = p.borderColor || bg;
+
+    // Variant-specific rendering
+    if (variant === "outline") {
+        // No fill, border only
+        draw.roundedRect(x, y, w, h, "", br, Math.max(bw, 1), bc, opacity);
+    } else if (variant === "ghost" || variant === "link") {
+        // No fill, no border
+    } else if (variant === "secondary") {
+        draw.roundedRect(x, y, w, h, bg, br, 0, "", opacity);
+        if (bw > 0) {
+            draw.roundedRect(x, y, w, h, "", br, bw, bc, opacity);
+        }
+    } else {
+        // Primary, Danger, Success, Warning — solid fill
+        if (variant === "danger") bg = p.background || _theme.error;
+        else if (variant === "success") bg = p.background || _theme.success;
+        else if (variant === "warning") bg = p.background || _theme.warning;
+        draw.roundedRect(x, y, w, h, bg, br, 0, "", opacity);
+    }
+
+    // Label
+    let label = p.loading ? "..." : (p.label || "");
+    if (label) {
+        let fontSize = p.fontSize || 14;
+        let fontWeight = variant === "link" ? 400 : 500;
+        let textX = x + 12;
+        let textY = y + (h - fontSize * 1.2) / 2;
+        let maxW = w - 24;
+        draw.text(label, textX, textY, fontSize, fontWeight, fg,
+            _theme.fontFamily, maxW, opacity);
+    }
+});
+
+// ─── Input ──────────────────────────────────────────────────────────────────
+registerComponent("Input", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let currentY = y;
+
+    // Label
+    if (p.label) {
+        draw.text(p.label, x, currentY, 14, 500, "rgba(217,217,222,1)",
+            _theme.fontFamily, w, 1);
+        currentY = currentY + 20;
+    }
+
+    // Input field dimensions
+    let size = p.size || "md";
+    let inputHeight = 40;
+    if (size === "sm") inputHeight = 32;
+    else if (size === "lg") inputHeight = 44;
+
+    let variant = p.variant || "outline";
+    let bg = p.background || _theme.inputBg;
+    let br = p.borderRadius !== undefined ? p.borderRadius : 6;
+    let bc = p.borderColor || _theme.inputBorder;
+    let fontSize = p.fontSize || 14;
+    let disabled = p.disabled;
+    let opacity = disabled ? 0.6 : 1;
+
+    // Focus/error/success state
+    let focused = false;
+    if (p.bindVar) {
+        focused = input.getFocusedInput() === p.bindVar;
+    }
+    let strokeWidth = 1;
+    if (focused) { bc = "#6366f1"; strokeWidth = 2; }
+    if (p.error) { bc = "#ef4444"; strokeWidth = 2; }
+    if (p.success) { bc = "#22c55e"; strokeWidth = 2; }
+
+    // Draw field
+    if (variant === "flushed") {
+        // Background
+        draw.rect(x, currentY, w, inputHeight, bg, 0, 0, "", opacity);
+        // Bottom border only
+        draw.line(x, currentY + inputHeight, x + w, currentY + inputHeight, bc, strokeWidth);
+    } else {
+        draw.roundedRect(x, currentY, w, inputHeight, bg, br, strokeWidth, bc, opacity);
+    }
+
+    // Value or placeholder text
+    let value = p.value || "";
+    let textColor = p.color || _theme.color;
+    let textY = currentY + (inputHeight - fontSize * 1.2) / 2;
+
+    if (p.inputType === "password" && value) {
+        value = "•".repeat(value.length);
+    }
+
+    if (value) {
+        draw.text(value, x + 14, textY, fontSize, 400, textColor,
+            _theme.fontFamily, w - 28, opacity);
+    } else if (p.placeholder) {
+        draw.text(p.placeholder, x + 14, textY, fontSize, 400, "rgba(161,161,168,1)",
+            _theme.fontFamily, w - 28, opacity);
+    }
+
+    // Cursor when focused
+    if (focused) {
+        let cursorX = x + 14;
+        if (value) {
+            let measured = draw.measureText(value, fontSize, 400, _theme.fontFamily, 0);
+            if (measured) cursorX = cursorX + measured.width;
+        }
+        let elapsed = input.getElapsedSecs();
+        if ((elapsed * 2) % 2 < 1) {
+            draw.rect(cursorX, textY + fontSize * 0.15, 1.5, fontSize, textColor, 0, 0, "", opacity);
+        }
+    }
+
+    currentY = currentY + inputHeight;
+
+    // Error message
+    if (p.error && p.errorMessage) {
+        draw.text(p.errorMessage, x, currentY + 4, 12, 400, "#ef4444",
+            _theme.fontFamily, w, 1);
+    }
+    // Helper text
+    else if (p.helperText) {
+        let helperColor = p.success ? "#22c55e" : "rgba(161,161,168,1)";
+        draw.text(p.helperText, x, currentY + 4, 12, 400, helperColor,
+            _theme.fontFamily, w, 1);
+    }
+});
+
+// ─── TextArea ───────────────────────────────────────────────────────────────
+registerComponent("TextArea", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || _theme.inputBg;
+    let br = p.borderRadius !== undefined ? p.borderRadius : 6;
+    let bc = p.borderColor || _theme.inputBorder;
+    let fontSize = p.fontSize || 14;
+    let disabled = p.disabled;
+    let opacity = disabled ? 0.6 : 1;
+
+    // Focus/error state
+    let focused = false;
+    if (p.bindVar) {
+        focused = input.getFocusedInput() === p.bindVar;
+    }
+    let strokeWidth = 1;
+    if (focused) { bc = "rgba(102,153,255,1)"; strokeWidth = 2; }
+    if (p.error) { bc = "#ef4444"; strokeWidth = 2; }
+
+    // Draw field
+    draw.roundedRect(x, y, w, h, bg, br, strokeWidth, bc, opacity);
+
+    // Value or placeholder
+    let value = p.value || "";
+    let textColor = p.color || _theme.color;
+
+    if (value) {
+        draw.text(value, x + 8, y + 8, fontSize, 400, textColor,
+            _theme.fontFamily, w - 16, opacity);
+    } else if (p.placeholder) {
+        let phColor = withAlpha(textColor, 0.5);
+        draw.text(p.placeholder, x + 8, y + 8, fontSize, 400, phColor,
+            _theme.fontFamily, w - 16, opacity);
+    }
+
+    // Cursor
+    if (focused) {
+        let cursorX = x + 8;
+        if (value) {
+            let measured = draw.measureText(value, fontSize, 400, _theme.fontFamily, w - 16);
+            if (measured) cursorX = cursorX + measured.width;
+        }
+        let elapsed = input.getElapsedSecs();
+        if ((elapsed * 2) % 2 < 1) {
+            draw.rect(cursorX, y + 8 + fontSize * 0.15, 1.5, fontSize, textColor, 0, 0, "", opacity);
+        }
+    }
+});
+
+// ─── Select ─────────────────────────────────────────────────────────────────
+registerComponent("Select", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let currentY = y;
+
+    // Label
+    if (p.label) {
+        draw.text(p.label, x, currentY, 14, 500, "rgba(217,217,222,1)",
+            _theme.fontFamily, w, 1);
+        currentY = currentY + 20;
+    }
+
+    // Field dimensions
+    let size = p.size || "md";
+    let fieldH = 40;
+    if (size === "sm") fieldH = 32;
+    else if (size === "lg") fieldH = 48;
+
+    let bg = p.background || _theme.inputBg;
+    let br = p.borderRadius !== undefined ? p.borderRadius : 6;
+    let bc = p.borderColor || _theme.inputBorder;
+    let fontSize = p.fontSize || 14;
+    let disabled = p.disabled;
+    let opacity = disabled ? 0.6 : 1;
+
+    if (p.error) { bc = "#ef4444"; }
+
+    draw.roundedRect(x, currentY, w, fieldH, bg, br, 1, bc, opacity);
+
+    // Display value or placeholder
+    let value = p.value || "";
+    let displayText = "";
+    if (value && p.options) {
+        for (let i = 0; i < p.options.length; i++) {
+            if (p.options[i].value === value) {
+                displayText = p.options[i].label;
+                break;
+            }
+        }
+    }
+
+    let textColor = p.color || _theme.color;
+    let textY = currentY + (fieldH - fontSize * 1.2) / 2;
+
+    if (displayText) {
+        draw.text(displayText, x + 12, textY, fontSize, 400, textColor,
+            _theme.fontFamily, w - 36, opacity);
+    } else if (p.placeholder) {
+        draw.text(p.placeholder, x + 12, textY, fontSize, 400, "rgba(161,161,168,1)",
+            _theme.fontFamily, w - 36, opacity);
+    }
+
+    // Dropdown chevron arrow
+    let arrowX = x + w - 20;
+    let arrowY = currentY + fieldH / 2;
+    let arrowColor = textColor;
+    // V chevron: 3-point path
+    let arrowPath = `M ${arrowX - 4} ${arrowY - 2} L ${arrowX} ${arrowY + 2} L ${arrowX + 4} ${arrowY - 2}`;
+    draw.path(arrowPath, "", 0, arrowColor, 1.5, opacity);
+
+    currentY = currentY + fieldH;
+
+    // Error message
+    if (p.error && p.errorMessage) {
+        draw.text(p.errorMessage, x, currentY + 4, 12, 400, "#ef4444",
+            _theme.fontFamily, w, 1);
+    }
+});
+
+// ─── Switch ─────────────────────────────────────────────────────────────────
+registerComponent("Switch", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let size = p.size || "md";
+    let trackW, trackH, thumbSize;
+    if (size === "sm") { trackW = 32; trackH = 18; thumbSize = 14; }
+    else if (size === "lg") { trackW = 56; trackH = 30; thumbSize = 26; }
+    else { trackW = 44; trackH = 24; thumbSize = 20; }
+
+    let checked = p.checked || false;
+    let disabled = p.disabled;
+    let opacity = disabled ? 0.5 : 1;
+
+    let onColor = p.onColor || _theme.primary;
+    let offColor = p.offColor || "rgba(100,100,100,1)";
+
+    let trackY = y + (h - trackH) / 2;
+    let trackRadius = trackH / 2;
+
+    // Track
+    let trackColor = checked ? onColor : offColor;
+    draw.roundedRect(x, trackY, trackW, trackH, trackColor, trackRadius, 0, "", opacity);
+
+    // Thumb
+    let thumbX = checked ? (x + trackW - thumbSize - 2) : (x + 2);
+    let thumbY = trackY + 2;
+    let thumbRadius = thumbSize / 2;
+    draw.roundedRect(thumbX, thumbY, thumbSize, thumbSize, "#ffffff", thumbRadius, 0, "", opacity);
+
+    // Label
+    if (p.label) {
+        let labelX = x + trackW + 8;
+        let labelY = y + (h - 14 * 1.2) / 2;
+        if (p.description) labelY = labelY - 8;
+        draw.text(p.label, labelX, labelY, 14, 500, "rgba(245,245,245,1)",
+            _theme.fontFamily, w - trackW - 8, opacity);
+    }
+    // Description
+    if (p.description) {
+        let descX = x + trackW + 8;
+        let descY = y + (h - 12 * 1.2) / 2 + 8;
+        draw.text(p.description, descX, descY, 12, 400, "rgba(161,161,168,1)",
+            _theme.fontFamily, w - trackW - 8, opacity);
+    }
+});
+
+// ─── Checkbox ───────────────────────────────────────────────────────────────
+registerComponent("Checkbox", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let size = p.size || 18;
+    let checked = p.checked || false;
+    let color = p.color || _theme.primary;
+
+    let boxX = x;
+    let boxY = y + (h - size) / 2;
+
+    if (checked) {
+        // Filled box
+        draw.roundedRect(boxX, boxY, size, size, color, 3, 0, "", 1);
+        // Checkmark
+        let cx = boxX + size / 2;
+        let cy = boxY + size / 2;
+        let s = size * 0.3;
+        let checkPath = `M ${cx - s} ${cy} L ${cx - s * 0.3} ${cy + s * 0.7} L ${cx + s} ${cy - s * 0.5}`;
+        draw.path(checkPath, "", 0, "#ffffff", 2, 1);
+    } else {
+        // Empty box with border
+        draw.roundedRect(boxX, boxY, size, size, "", 3, 1.5, "rgba(153,153,153,1)", 1);
+    }
+
+    // Label
+    if (p.label) {
+        let labelX = x + size + 8;
+        let labelY = y + (h - 14 * 1.2) / 2;
+        draw.text(p.label, labelX, labelY, 14, 400, "rgba(230,230,230,1)",
+            _theme.fontFamily, w - size - 8, 1);
+    }
+});
+
+// ─── Radio ──────────────────────────────────────────────────────────────────
+registerComponent("Radio", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let size = p.size || 18;
+    let checked = p.checked || false;
+    let color = p.color || _theme.primary;
+
+    let cx = x + size / 2;
+    let cy = y + h / 2;
+    let radius = size / 2;
+
+    if (checked) {
+        // Filled outer circle
+        draw.circle(cx, cy, radius, color, 0, "", 1);
+        // White inner dot
+        draw.circle(cx, cy, radius * 0.4, "#ffffff", 0, "", 1);
+    } else {
+        // Empty circle with border
+        draw.circle(cx, cy, radius, "", 1.5, "rgba(153,153,153,1)", 1);
+    }
+
+    // Label
+    if (p.label) {
+        let labelX = x + size + 8;
+        let labelY = y + (h - 14 * 1.2) / 2;
+        draw.text(p.label, labelX, labelY, 14, 400, "rgba(230,230,230,1)",
+            _theme.fontFamily, w - size - 8, 1);
+    }
+});
+
+// ─── Slider ─────────────────────────────────────────────────────────────────
+registerComponent("Slider", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let min = p.min !== undefined ? p.min : 0;
+    let max = p.max !== undefined ? p.max : 100;
+    let value = p.value !== undefined ? p.value : 0;
+    let disabled = p.disabled;
+    let opacity = disabled ? 0.5 : 1;
+
+    let size = p.size || "md";
+    let trackH, thumbSize;
+    if (size === "sm") { trackH = 4; thumbSize = 12; }
+    else if (size === "lg") { trackH = 8; thumbSize = 20; }
+    else { trackH = 6; thumbSize = 16; }
+
+    let color = p.color || _theme.primary;
+    let trackColor = p.trackColor || "rgba(100,100,100,0.4)";
+
+    let cy = y + h / 2;
+    let trackY = cy - trackH / 2;
+    let trackRadius = trackH / 2;
+
+    // Background track
+    draw.roundedRect(x, trackY, w, trackH, trackColor, trackRadius, 0, "", opacity);
+
+    // Fill
+    let range = max - min;
+    let fraction = range > 0 ? Math.max(0, Math.min(1, (value - min) / range)) : 0;
+    let fillW = w * fraction;
+    if (fillW > 0) {
+        draw.roundedRect(x, trackY, fillW, trackH, color, trackRadius, 0, "", opacity);
+    }
+
+    // Thumb
+    let thumbX = x + fillW - thumbSize / 2;
+    let thumbY = cy - thumbSize / 2;
+    let thumbRadius = thumbSize / 2;
+    draw.circle(thumbX + thumbRadius, thumbY + thumbRadius, thumbRadius, color, 0, "", opacity);
+    draw.circle(thumbX + thumbRadius, thumbY + thumbRadius, thumbRadius * 0.5, "#ffffff", 0, "", opacity);
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Button", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingLeft: 16,
+    paddingRight: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Input", {
+    width: "100%",
+    flexShrink: 0
+});
+
+registerDefaultStyle("TextArea", {
+    width: "100%",
+    height: 120,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Select", {
+    width: "100%",
+    flexShrink: 0
+});
+
+registerDefaultStyle("Switch", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    height: 24,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Checkbox", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    height: 24,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Radio", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    height: 24,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Slider", {
+    width: "100%",
+    height: 24,
+    flexShrink: 0
+});
+
+// ============================================================================
+// Display Components: Badge, NavItem, Placeholder, Image, Avatar, Progress,
+//                     Spinner, Skeleton, Tag, Modal, Toast
+// ============================================================================
+
+// ─── Badge ──────────────────────────────────────────────────────────────────
+registerComponent("Badge", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || _theme.primary;
+    let color = p.color || "#ffffff";
+    let badgeStyle = p.badgeStyle || "solid";
+    let pill = p.pill || false;
+    let size = p.size || "md";
+
+    let br;
+    if (pill) { br = 9999; }
+    else if (size === "xs" || size === "sm") { br = 4; }
+    else if (size === "lg") { br = 8; }
+    else { br = 6; }
+
+    let fontSize = 12;
+    if (size === "xs") fontSize = 10;
+    else if (size === "sm") fontSize = 11;
+    else if (size === "lg") fontSize = 14;
+
+    if (badgeStyle === "solid") {
+        draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+    } else if (badgeStyle === "subtle") {
+        draw.roundedRect(x, y, w, h, withAlpha(bg, 0.5), br, 0, "", 1);
+    } else if (badgeStyle === "outline") {
+        draw.roundedRect(x, y, w, h, "", br, 1, color, 1);
+    }
+
+    let label = p.label || "";
+    if (label) {
+        let px = size === "xs" ? 4 : (size === "sm" ? 6 : (size === "lg" ? 10 : 8));
+        let textY = y + (h - fontSize * 1.2) / 2;
+        draw.text(label, x + px, textY, fontSize, 500, color,
+            _theme.fontFamily, w - px * 2, 1);
+    }
+});
+
+// ─── NavItem ────────────────────────────────────────────────────────────────
+registerComponent("NavItem", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let active = p.active || false;
+
+    if (active) {
+        // Active background highlight
+        draw.roundedRect(x, y, w, h, "rgba(99,102,241,0.1)", 8, 0, "", 1);
+        // Left accent bar
+        let barH = h * 0.6;
+        let barY = y + (h - barH) / 2;
+        draw.roundedRect(x, barY, 3, barH, "#6366f1", 2, 0, "", 1);
+    }
+
+    // Label
+    let label = p.label || "";
+    if (label) {
+        let textColor = active ? "#ffffff" : "#a1a1aa";
+        let textWeight = active ? 500 : 400;
+        let textX = x + 32;
+        let textY = y + (h - 14 * 1.2) / 2;
+        draw.text(label, textX, textY, 14, textWeight, textColor,
+            _theme.fontFamily, w - 44, 1);
+    }
+});
+
+// ─── Placeholder ────────────────────────────────────────────────────────────
+registerComponent("Placeholder", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    // Faint fill
+    draw.roundedRect(x, y, w, h, "rgba(255,255,255,0.03)", 8, 0, "", 1);
+    // Dashed border (approximated as solid since we don't have dash support)
+    draw.roundedRect(x, y, w, h, "", 8, 1.5, "rgba(255,255,255,0.2)", 1);
+
+    // Centered name text
+    let name = p.componentName || p.name || "Placeholder";
+    let fontSize = 13;
+    let textW = name.length * fontSize * 0.55;
+    let textX = x + (w - textW) / 2;
+    let textY = y + (h - fontSize * 1.2) / 2;
+    draw.text(name, textX, textY, fontSize, 400, "rgba(255,255,255,0.3)",
+        _theme.fontFamily, w, 1);
+});
+
+// ─── Image ──────────────────────────────────────────────────────────────────
+registerComponent("Image", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || "rgba(40,40,50,1)";
+    let br = p.borderRadius || 0;
+
+    // Background placeholder
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    // Mountain icon (placeholder for actual image)
+    let iconSize = Math.min(24, w * 0.3, h * 0.3);
+    if (iconSize > 4) {
+        let iconX = x + (w - iconSize) / 2;
+        let iconY = y + (h - iconSize) / 2 - 8;
+        // Simple mountain shape
+        let mx = iconX;
+        let my = iconY + iconSize;
+        let path = `M ${mx} ${my} L ${mx + iconSize * 0.3} ${iconY + iconSize * 0.3} L ${mx + iconSize * 0.5} ${iconY + iconSize * 0.5} L ${mx + iconSize * 0.7} ${iconY} L ${mx + iconSize} ${my} Z`;
+        draw.path(path, "rgba(255,255,255,0.2)", 0, "", 0, 1);
+    }
+
+    // Alt text
+    let alt = p.alt || p.src || "";
+    if (alt) {
+        if (alt.length > 30) alt = alt.slice(0, 30);
+        let fontSize = 11;
+        let textW = alt.length * fontSize * 0.55;
+        let textX = x + (w - textW) / 2;
+        let textY = y + h / 2 + 8;
+        draw.text(alt, textX, textY, fontSize, 400, "rgba(255,255,255,0.3)",
+            _theme.fontFamily, w - 8, 1);
+    }
+});
+
+// ─── Avatar ─────────────────────────────────────────────────────────────────
+registerComponent("Avatar", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let size = p.size || cl.width;
+
+    let bg = p.background || _theme.primary;
+    let color = p.color || "#ffffff";
+    let br = p.borderRadius !== undefined ? p.borderRadius : (size / 2);
+
+    // Background shape
+    draw.roundedRect(x, y, size, size, bg, br, 0, "", 1);
+
+    // Border
+    if (p.border) {
+        let bc = p.borderColor || "rgba(255,255,255,0.2)";
+        draw.roundedRect(x, y, size, size, "", br, 2, bc, 1);
+    }
+
+    // Fallback initials
+    let fallback = p.fallback || "";
+    if (!fallback && p.name) {
+        let parts = p.name.split(" ");
+        fallback = "";
+        for (let i = 0; i < Math.min(2, parts.length); i++) {
+            if (parts[i].length > 0) fallback = fallback + parts[i][0].toUpperCase();
+        }
+    }
+
+    if (fallback) {
+        let fontSize = size * 0.4;
+        let measured = draw.measureText(fallback, fontSize, 700, _theme.fontFamily, 0);
+        let textW = measured ? measured.width : (fallback.length * fontSize * 0.6);
+        let textX = x + (size - textW) / 2;
+        let textY = y + (size - fontSize) / 2;
+        draw.text(fallback, textX, textY, fontSize, 700, color,
+            _theme.fontFamily, size, 1);
+    }
+
+    // Status indicator
+    let status = p.status;
+    if (status && status !== "none") {
+        let dotSize = Math.max(6, size * 0.25);
+        let dotX = x + size - dotSize;
+        let dotY = y + size - dotSize;
+
+        // Dark outline ring
+        draw.circle(dotX + dotSize / 2, dotY + dotSize / 2, dotSize / 2 + 1.5, "#09090b", 0, "", 1);
+
+        // Status dot
+        let dotColor;
+        if (status === "online") dotColor = "#22c55e";
+        else if (status === "offline") dotColor = "#9ca3af";
+        else if (status === "away") dotColor = "#f59e0b";
+        else if (status === "busy") dotColor = "#ef4444";
+        else dotColor = "#9ca3af";
+        draw.circle(dotX + dotSize / 2, dotY + dotSize / 2, dotSize / 2, dotColor, 0, "", 1);
+    }
+});
+
+// ─── Progress ───────────────────────────────────────────────────────────────
+registerComponent("Progress", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let value = p.value !== undefined ? p.value : 0;
+    let max = p.max !== undefined ? p.max : 100;
+    let color = p.color || _theme.primary;
+    let trackColor = p.trackColor || "rgba(100,100,100,0.3)";
+    let barH = p.height || h;
+    let br = p.borderRadius !== undefined ? p.borderRadius : (barH / 2);
+
+    // Track
+    draw.roundedRect(x, y, w, barH, trackColor, br, 0, "", 1);
+
+    // Fill
+    let fraction = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
+    let fillW = w * fraction;
+    if (fillW > 0) {
+        draw.roundedRect(x, y, fillW, barH, color, br, 0, "", 1);
+    }
+
+    // Label
+    if (p.showLabel) {
+        let pct = Math.round(fraction * 100) + "%";
+        let fontSize = Math.max(barH - 2, 10);
+        draw.text(pct, x + 4, y + (barH - fontSize * 1.2) / 2, fontSize, 700, "#ffffff",
+            _theme.fontFamily, w - 8, 1);
+    }
+});
+
+// ─── Spinner ────────────────────────────────────────────────────────────────
+registerComponent("Spinner", (node, cl) => {
+    let p = node.props;
+    let cx = cl.x + cl.width / 2;
+    let cy = cl.y + cl.height / 2;
+    let size = p.size || Math.min(cl.width, cl.height);
+    let thickness = p.thickness || 3;
+    let color = p.color || _theme.primary;
+
+    let radius = size / 2 - thickness;
+    let elapsed = input.getElapsedSecs();
+    let startAngle = elapsed * 4;
+    let arcAngle = Math.PI * 1.5; // 270 degrees
+
+    // Draw arc as polyline segments
+    let segments = 32;
+    let path = "";
+    for (let i = 0; i <= segments; i++) {
+        let a = startAngle + (i / segments) * arcAngle;
+        let px = cx + Math.cos(a) * radius;
+        let py = cy + Math.sin(a) * radius;
+        if (i === 0) path = `M ${px} ${py}`;
+        else path = path + ` L ${px} ${py}`;
+    }
+    draw.path(path, "", 0, color, thickness, 1);
+});
+
+// ─── Skeleton ───────────────────────────────────────────────────────────────
+registerComponent("Skeleton", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let variant = p.variant || "rect";
+
+    let elapsed = input.getElapsedSecs();
+    let alpha = 0.15 + 0.1 * Math.sin(elapsed * 2);
+
+    let color = `rgba(255,255,255,${alpha})`;
+
+    if (variant === "circle") {
+        let r = Math.min(w, h) / 2;
+        draw.circle(x + w / 2, y + h / 2, r, color, 0, "", 1);
+    } else {
+        let br = p.borderRadius || 4;
+        draw.roundedRect(x, y, w, h, color, br, 0, "", 1);
+    }
+});
+
+// ─── Tag ────────────────────────────────────────────────────────────────────
+registerComponent("Tag", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || _theme.primary;
+    let color = p.color || "#ffffff";
+    let br = p.borderRadius !== undefined ? p.borderRadius : 4;
+
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    let label = p.label || "";
+    if (label) {
+        let textY = y + (h - 12 * 1.2) / 2;
+        draw.text(label, x + 8, textY, 12, 500, color,
+            _theme.fontFamily, w - 16, 1);
+    }
+});
+
+// ─── Modal ──────────────────────────────────────────────────────────────────
+registerComponent("Modal", (node, cl) => {
+    let p = node.props;
+    if (!p.open) return;
+
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    // Backdrop overlay
+    draw.rect(x, y, w, h, "rgba(0,0,0,0.5)", 0, 0, "", 1);
+
+    // Centered card
+    let cardW = Math.min(p.width || 480, w - 32);
+    let cardH = Math.min(h * 0.6, h - 32);
+    let bg = p.background || "#1e1e23";
+    let br = p.borderRadius || 12;
+
+    let cardX = x + (w - cardW) / 2;
+    let cardY = y + (h - cardH) / 2;
+
+    draw.roundedRect(cardX, cardY, cardW, cardH, bg, br, 0, "", 1);
+});
+
+// ─── Toast ──────────────────────────────────────────────────────────────────
+registerComponent("Toast", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || "#1e293b";
+    let color = p.color || "#ffffff";
+
+    // Drop shadow
+    draw.roundedRect(x + 2, y + 2, w, h, "rgba(0,0,0,0.3)", 8, 0, "", 1);
+    // Card
+    draw.roundedRect(x, y, w, h, bg, 8, 0, "", 1);
+
+    // Message
+    let msg = p.message || "";
+    if (msg) {
+        let textY = y + (h - 14 * 1.2) / 2;
+        draw.text(msg, x + 12, textY, 14, 500, color,
+            _theme.fontFamily, w - 24, 1);
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Badge", {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingLeft: 8,
+    paddingRight: 8,
+    paddingTop: 2,
+    paddingBottom: 2,
+    flexShrink: 0
+});
+
+registerDefaultStyle("NavItem", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    width: "100%",
+    height: 40,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Placeholder", {
+    width: "100%",
+    height: 120
+});
+
+registerDefaultStyle("Image", {
+    flexShrink: 0
+});
+
+registerDefaultStyle("Avatar", {
+    flexShrink: 0
+});
+
+registerDefaultStyle("Progress", {
+    width: "100%",
+    height: 8,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Spinner", {
+    width: 32,
+    height: 32,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Skeleton", {
+    width: "100%",
+    height: 20,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Tag", {
+    display: "flex",
+    alignItems: "center",
+    paddingLeft: 8,
+    paddingRight: 8,
+    paddingTop: 4,
+    paddingBottom: 4,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Modal", {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 1000
+});
+
+registerDefaultStyle("Toast", {
+    position: "absolute",
+    top: 16,
+    right: 16,
+    width: 320,
+    height: 48,
+    zIndex: 1001
+});
+
+// ============================================================================
+// Feedback Components: Alert, Drawer, EmptyState, Popover
+// ============================================================================
+
+// ─── Alert ──────────────────────────────────────────────────────────────────
+registerComponent("Alert", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || "rgba(30,30,40,1)";
+    let color = p.color || _theme.info;
+    let br = p.borderRadius !== undefined ? p.borderRadius : 8;
+
+    // Background
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    // Left accent bar
+    draw.rect(x, y, 3, h, color, 0, 0, "", 1);
+
+    // Title
+    if (p.title) {
+        draw.text(p.title, x + 16, y + 12, 14, 600, color,
+            _theme.fontFamily, w - 28, 1);
+    }
+
+    // Description
+    if (p.description) {
+        let descY = p.title ? y + 32 : y + 12;
+        draw.text(p.description, x + 16, descY, 13, 400, withAlpha(color, 0.8),
+            _theme.fontFamily, w - 28, 1);
+    }
+});
+
+// ─── Drawer ─────────────────────────────────────────────────────────────────
+registerComponent("Drawer", (node, cl) => {
+    let p = node.props;
+    if (!p.open) return;
+
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || "#1e1e23";
+
+    draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    // Edge border
+    draw.line(x, y, x, y + h, "rgba(255,255,255,0.1)", 1);
+});
+
+// ─── EmptyState ─────────────────────────────────────────────────────────────
+registerComponent("EmptyState", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let color = p.color || "rgba(200,200,200,1)";
+    let currentY = y + 24;
+
+    // Title
+    if (p.title) {
+        let fontSize = 16;
+        let textW = p.title.length * fontSize * 0.55;
+        let textX = x + (w - textW) / 2;
+        draw.text(p.title, textX, currentY + 48, fontSize, 600, color,
+            _theme.fontFamily, w, 1);
+        currentY = currentY + 48;
+    }
+
+    // Description
+    if (p.description) {
+        let fontSize = 13;
+        let textW = p.description.length * fontSize * 0.55;
+        let textX = x + (w - textW) / 2;
+        draw.text(p.description, textX, currentY + 24, fontSize, 400,
+            withAlpha(color, 0.7), _theme.fontFamily, w, 1);
+    }
+});
+
+// ─── Popover ────────────────────────────────────────────────────────────────
+registerComponent("Popover", (node, cl) => {
+    let p = node.props;
+    if (!p.visible) return;
+
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let bg = p.background || "#1e293b";
+    let color = p.color || "#ffffff";
+    let br = p.borderRadius || 8;
+
+    // Shadow
+    draw.roundedRect(x + 1, y + 1, w, h, "rgba(0,0,0,0.25)", br, 0, "", 1);
+    // Card
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    // Content text
+    if (p.content) {
+        let textY = y + (h - 13 * 1.2) / 2;
+        draw.text(p.content, x + 8, textY, 13, 400, color,
+            _theme.fontFamily, w - 16, 1);
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Alert", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%",
+    paddingTop: 12,
+    paddingBottom: 12,
+    paddingLeft: 16,
+    paddingRight: 16,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Drawer", {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    width: 320,
+    height: "100%",
+    zIndex: 999
+});
+
+registerDefaultStyle("EmptyState", {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "100%",
+    paddingTop: 48,
+    paddingBottom: 48
+});
+
+registerDefaultStyle("Popover", {
+    position: "absolute",
+    zIndex: 998,
+    width: 200,
+    paddingTop: 8,
+    paddingBottom: 8
+});
+
+// ============================================================================
+// Navigation Components: Tabs, Menu, Breadcrumb
+// ============================================================================
+
+// ─── Tabs ───────────────────────────────────────────────────────────────────
+registerComponent("Tabs", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let tabs = p.tabs || [];
+    if (tabs.length === 0) return;
+
+    let bg = p.background;
+    let color = p.color || "rgba(161,161,170,1)";
+    let activeColor = p.activeColor || _theme.primary;
+    let fontSize = p.fontSize || 14;
+    let activeKey = p.activeKey || "";
+
+    // Background
+    if (bg) {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    // Bottom border
+    draw.line(x, y + h, x + w, y + h, "rgba(255,255,255,0.1)", 1);
+
+    // Tab items
+    let tabW = w / tabs.length;
+    for (let i = 0; i < tabs.length; i++) {
+        let tab = tabs[i];
+        let tabX = x + i * tabW;
+        let isActive = tab.key === activeKey;
+
+        let textColor = isActive ? activeColor : color;
+        let fontWeight = isActive ? 600 : 400;
+        let label = tab.label || tab.key || "";
+
+        // Center text in tab
+        let textW = label.length * fontSize * 0.55;
+        let textX = tabX + (tabW - textW) / 2;
+        let textY = y + (h - fontSize * 1.2) / 2;
+
+        draw.text(label, textX, textY, fontSize, fontWeight, textColor,
+            _theme.fontFamily, tabW, 1);
+
+        // Active indicator bar
+        if (isActive) {
+            draw.rect(tabX, y + h - 2, tabW, 2, activeColor, 0, 0, "", 1);
+        }
+    }
+});
+
+// ─── Menu ───────────────────────────────────────────────────────────────────
+registerComponent("Menu", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let items = p.items || [];
+    if (items.length === 0) return;
+
+    let bg = p.background;
+    let color = p.color || "rgba(200,200,200,1)";
+
+    if (bg) {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    let itemH = h / items.length;
+    for (let i = 0; i < items.length; i++) {
+        let item = items[i];
+        let itemY = y + i * itemH;
+
+        let textX = item.icon ? (x + 32) : (x + 12);
+        let textY = itemY + (itemH - 14 * 1.2) / 2;
+        let maxW = item.icon ? (w - 44) : (w - 24);
+
+        draw.text(item.label || "", textX, textY, 14, 400, color,
+            _theme.fontFamily, maxW, 1);
+    }
+});
+
+// ─── Breadcrumb ─────────────────────────────────────────────────────────────
+registerComponent("Breadcrumb", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let items = p.items || [];
+    if (items.length === 0) return;
+
+    let color = p.color || "rgba(161,161,170,1)";
+    let activeColor = p.activeColor || "#ffffff";
+    let fontSize = p.fontSize || 14;
+    let separator = p.separator || "/";
+
+    let currentX = x;
+    let textY = y + (h - fontSize * 1.2) / 2;
+
+    for (let i = 0; i < items.length; i++) {
+        let item = items[i];
+        let isLast = i === items.length - 1;
+        let label = item.label || "";
+        let textColor = isLast ? activeColor : color;
+        let fontWeight = isLast ? 600 : 400;
+
+        let measured = draw.measureText(label, fontSize, fontWeight, _theme.fontFamily, 0);
+        let textW = measured ? measured.width : (label.length * fontSize * 0.55);
+        let maxW = Math.min(textW, 200);
+
+        draw.text(label, currentX, textY, fontSize, fontWeight, textColor,
+            _theme.fontFamily, maxW, 1);
+        currentX = currentX + maxW;
+
+        // Separator (not after last item)
+        if (!isLast) {
+            let sepColor = withAlpha(color, 0.4);
+            currentX = currentX + 4;
+            draw.text(separator, currentX, textY, fontSize, 400, sepColor,
+                _theme.fontFamily, 20, 1);
+            let sepMeasured = draw.measureText(separator, fontSize, 400, _theme.fontFamily, 0);
+            currentX = currentX + (sepMeasured ? sepMeasured.width : 8) + 4;
+        }
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Tabs", {
+    display: "flex",
+    flexDirection: "row",
+    width: "100%",
+    height: 48,
+    flexShrink: 0
+});
+
+registerDefaultStyle("Menu", {
+    display: "flex",
+    flexDirection: "column",
+    width: "100%"
+});
+
+registerDefaultStyle("Breadcrumb", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    width: "100%",
+    height: 32,
+    flexShrink: 0
+});
+
+// ============================================================================
+// Chart Components: LineChart, AreaChart, BarChart, PieChart, GaugeChart,
+//                   RadarChart
+// ============================================================================
+
+// Shared chart helpers
+let _chartBg = "#16161a";
+let _chartGrid = "rgba(255,255,255,0.08)";
+let _chartText = "rgba(255,255,255,0.5)";
+let _chartPadLeft = 40;
+let _chartPadRight = 20;
+let _chartPadTop = 10;
+let _chartPadBottom = 40;
+
+function _chartDataRange(series) {
+    let minVal = Infinity;
+    let maxVal = -Infinity;
+    for (let s = 0; s < series.length; s++) {
+        let data = series[s].data;
+        for (let i = 0; i < data.length; i++) {
+            let v = data[i].value;
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+        }
+    }
+    if (minVal === Infinity) { minVal = 0; maxVal = 100; }
+    if (minVal === maxVal) { maxVal = minVal + 1; }
+    return [minVal, maxVal];
+}
+
+function _formatNum(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+    if (n === Math.floor(n)) return n.toString();
+    return n.toFixed(1);
+}
+
+// ─── LineChart ──────────────────────────────────────────────────────────────
+registerComponent("LineChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let y0 = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let series = p.series || [];
+    if (series.length === 0) return;
+
+    // Find max data points
+    let maxPts = 0;
+    for (let s = 0; s < series.length; s++) {
+        if (series[s].data.length > maxPts) maxPts = series[s].data.length;
+    }
+    if (maxPts < 2) return;
+
+    // Background
+    draw.roundedRect(x0, y0, w, h, _chartBg, 8, 0, "", 1);
+
+    let cx = x0 + _chartPadLeft;
+    let cy = y0 + _chartPadTop;
+    let cw = w - _chartPadLeft - _chartPadRight;
+    let ch = h - _chartPadTop - _chartPadBottom;
+
+    let range = _chartDataRange(series);
+    let minVal = range[0];
+    let maxVal = range[1];
+    let valRange = maxVal - minVal;
+
+    // Grid lines + Y-axis labels
+    for (let i = 0; i <= 4; i++) {
+        let gy = cy + ch * (1 - i / 4);
+        draw.line(cx, gy, cx + cw, gy, _chartGrid, 0.5);
+        let label = _formatNum(minVal + valRange * (i / 4));
+        draw.text(label, x0 + 2, gy - 5, 10, 400, _chartText,
+            _theme.fontFamily, 36, 1);
+    }
+
+    // Draw each series
+    for (let s = 0; s < series.length; s++) {
+        let ser = series[s];
+        let data = ser.data;
+        let color = ser.color || _theme.primary;
+
+        // Build line path + fill path
+        let linePath = "";
+        let fillPath = "";
+        for (let i = 0; i < data.length; i++) {
+            let px = cx + cw * (i / (maxPts - 1));
+            let py = cy + ch * (1 - (data[i].value - minVal) / valRange);
+            if (i === 0) {
+                linePath = `M ${px} ${py}`;
+                fillPath = `M ${cx} ${cy + ch} L ${px} ${py}`;
+            } else {
+                linePath = linePath + ` L ${px} ${py}`;
+                fillPath = fillPath + ` L ${px} ${py}`;
+            }
+        }
+        // Close fill path
+        let lastX = cx + cw * ((data.length - 1) / (maxPts - 1));
+        fillPath = fillPath + ` L ${lastX} ${cy + ch} Z`;
+
+        // Fill area
+        draw.path(fillPath, withAlpha(color, 0.08), 0, "", 0, 1);
+        // Line
+        draw.path(linePath, "", 0, color, 2, 1);
+
+        // Data points
+        for (let i = 0; i < data.length; i++) {
+            let px = cx + cw * (i / (maxPts - 1));
+            let py = cy + ch * (1 - (data[i].value - minVal) / valRange);
+            draw.circle(px, py, 3, color, 0, "", 1);
+        }
+    }
+
+    // X-axis labels
+    let firstSeries = series[0];
+    let labelStep = maxPts > 8 ? 2 : 1;
+    for (let i = 0; i < firstSeries.data.length; i = i + labelStep) {
+        let px = cx + cw * (i / (maxPts - 1));
+        let label = firstSeries.data[i].label || "";
+        if (label) {
+            draw.text(label, px - 15, cy + ch + 6, 10, 400, _chartText,
+                _theme.fontFamily, 40, 1);
+        }
+    }
+
+    // Legend
+    let lx = cx;
+    let ly = y0 + h - 14;
+    for (let s = 0; s < series.length; s++) {
+        let ser = series[s];
+        let color = ser.color || _theme.primary;
+        draw.rect(lx, ly, 8, 8, color, 0, 0, "", 1);
+        lx = lx + 12;
+        let name = ser.name || "";
+        draw.text(name, lx, ly - 2, 10, 400, _chartText,
+            _theme.fontFamily, 100, 1);
+        lx = lx + name.length * 5.5 + 12;
+    }
+});
+
+// ─── AreaChart ──────────────────────────────────────────────────────────────
+registerComponent("AreaChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let y0 = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let series = p.series || [];
+    if (series.length === 0) return;
+
+    let maxPts = 0;
+    for (let s = 0; s < series.length; s++) {
+        if (series[s].data.length > maxPts) maxPts = series[s].data.length;
+    }
+    if (maxPts < 2) return;
+
+    draw.roundedRect(x0, y0, w, h, _chartBg, 8, 0, "", 1);
+
+    let cx = x0 + _chartPadLeft;
+    let cy = y0 + _chartPadTop;
+    let cw = w - _chartPadLeft - _chartPadRight;
+    let ch = h - _chartPadTop - _chartPadBottom;
+
+    let range = _chartDataRange(series);
+    let minVal = range[0];
+    let maxVal = range[1];
+    let valRange = maxVal - minVal;
+
+    // Grid
+    if (p.showGrid !== false) {
+        for (let i = 0; i <= 4; i++) {
+            let gy = cy + ch * (1 - i / 4);
+            draw.line(cx, gy, cx + cw, gy, _chartGrid, 0.5);
+            let label = _formatNum(minVal + valRange * (i / 4));
+            draw.text(label, x0 + 2, gy - 5, 10, 400, _chartText,
+                _theme.fontFamily, 36, 1);
+        }
+    }
+
+    let fillOpacity = p.fillOpacity !== undefined ? p.fillOpacity : 0.3;
+
+    for (let s = 0; s < series.length; s++) {
+        let ser = series[s];
+        let data = ser.data;
+        let color = ser.color || _theme.primary;
+
+        let linePath = "";
+        let fillPath = "";
+        for (let i = 0; i < data.length; i++) {
+            let px = cx + cw * (i / (maxPts - 1));
+            let py = cy + ch * (1 - (data[i].value - minVal) / valRange);
+            if (i === 0) {
+                linePath = `M ${px} ${py}`;
+                fillPath = `M ${cx} ${cy + ch} L ${px} ${py}`;
+            } else {
+                linePath = linePath + ` L ${px} ${py}`;
+                fillPath = fillPath + ` L ${px} ${py}`;
+            }
+        }
+        let lastX = cx + cw * ((data.length - 1) / (maxPts - 1));
+        fillPath = fillPath + ` L ${lastX} ${cy + ch} Z`;
+
+        draw.path(fillPath, withAlpha(color, fillOpacity), 0, "", 0, 1);
+        draw.path(linePath, "", 0, color, 2, 1);
+    }
+});
+
+// ─── BarChart ───────────────────────────────────────────────────────────────
+registerComponent("BarChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let y0 = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let series = p.series || [];
+    if (series.length === 0) return;
+
+    let maxPts = 0;
+    for (let s = 0; s < series.length; s++) {
+        if (series[s].data.length > maxPts) maxPts = series[s].data.length;
+    }
+    if (maxPts === 0) return;
+
+    draw.roundedRect(x0, y0, w, h, _chartBg, 8, 0, "", 1);
+
+    let cx = x0 + _chartPadLeft;
+    let cy = y0 + _chartPadTop;
+    let cw = w - _chartPadLeft - _chartPadRight;
+    let ch = h - _chartPadTop - _chartPadBottom;
+    let stacked = p.stacked || false;
+
+    // Compute max value
+    let maxVal = 0;
+    if (stacked) {
+        for (let i = 0; i < maxPts; i++) {
+            let sum = 0;
+            for (let s = 0; s < series.length; s++) {
+                if (i < series[s].data.length) sum = sum + series[s].data[i].value;
+            }
+            if (sum > maxVal) maxVal = sum;
+        }
+    } else {
+        for (let s = 0; s < series.length; s++) {
+            for (let i = 0; i < series[s].data.length; i++) {
+                if (series[s].data[i].value > maxVal) maxVal = series[s].data[i].value;
+            }
+        }
+    }
+    if (maxVal <= 0) maxVal = 1;
+
+    // Grid
+    for (let i = 0; i <= 4; i++) {
+        let gy = cy + ch * (1 - i / 4);
+        draw.line(cx, gy, cx + cw, gy, _chartGrid, 0.5);
+        let label = _formatNum(maxVal * (i / 4));
+        draw.text(label, x0 + 2, gy - 5, 10, 400, _chartText,
+            _theme.fontFamily, 36, 1);
+    }
+
+    let groupW = cw / maxPts;
+
+    if (stacked) {
+        for (let i = 0; i < maxPts; i++) {
+            let gx = cx + i * groupW;
+            let barW = groupW - 8;
+            let stackY = cy + ch;
+            for (let s = 0; s < series.length; s++) {
+                let val = i < series[s].data.length ? series[s].data[i].value : 0;
+                let barH = ch * (val / maxVal);
+                stackY = stackY - barH;
+                let br = (s === series.length - 1) ? 3 : 0;
+                draw.roundedRect(gx + 4, stackY, barW, barH, series[s].color || _theme.primary, br, 0, "", 1);
+            }
+        }
+    } else {
+        let nSeries = series.length;
+        for (let i = 0; i < maxPts; i++) {
+            let gx = cx + i * groupW;
+            let barW = (groupW - 8) / nSeries;
+            for (let s = 0; s < nSeries; s++) {
+                let val = i < series[s].data.length ? series[s].data[i].value : 0;
+                let barH = ch * (val / maxVal);
+                let barX = gx + 4 + s * barW;
+                let barY = cy + ch - barH;
+                draw.roundedRect(barX, barY, barW - 1, barH, series[s].color || _theme.primary, 3, 0, "", 1);
+            }
+        }
+    }
+
+    // X-axis labels
+    let firstSeries = series[0];
+    for (let i = 0; i < firstSeries.data.length; i++) {
+        let gx = cx + i * groupW + groupW / 2;
+        let label = firstSeries.data[i].label || "";
+        if (label) {
+            draw.text(label, gx - 15, cy + ch + 6, 10, 400, _chartText,
+                _theme.fontFamily, 40, 1);
+        }
+    }
+
+    // Legend
+    let lx = cx;
+    let ly = y0 + h - 14;
+    for (let s = 0; s < series.length; s++) {
+        let ser = series[s];
+        draw.rect(lx, ly, 8, 8, ser.color || _theme.primary, 0, 0, "", 1);
+        lx = lx + 12;
+        let name = ser.name || "";
+        draw.text(name, lx, ly - 2, 10, 400, _chartText,
+            _theme.fontFamily, 100, 1);
+        lx = lx + name.length * 5.5 + 12;
+    }
+});
+
+// ─── PieChart ───────────────────────────────────────────────────────────────
+registerComponent("PieChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let y0 = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let slices = p.slices || [];
+    if (slices.length === 0) return;
+
+    let total = 0;
+    for (let i = 0; i < slices.length; i++) total = total + slices[i].value;
+    if (total <= 0) return;
+
+    let cx = x0 + w / 2;
+    let cy = y0 + h / 2;
+    let radius = Math.min(w, h) / 2 - 20;
+    let innerRadius = p.innerRadius || 0;
+
+    let startAngle = -Math.PI / 2;
+
+    for (let i = 0; i < slices.length; i++) {
+        let slice = slices[i];
+        let sweep = 2 * Math.PI * (slice.value / total);
+        let color = slice.color || _theme.primary;
+
+        // Build arc path
+        let steps = Math.max(2, Math.ceil(sweep / 0.05));
+        let path = "";
+
+        if (innerRadius > 0) {
+            // Donut: outer arc forward, inner arc reverse
+            for (let j = 0; j <= steps; j++) {
+                let a = startAngle + (j / steps) * sweep;
+                let px = cx + Math.cos(a) * radius;
+                let py = cy + Math.sin(a) * radius;
+                if (j === 0) path = `M ${px} ${py}`;
+                else path = path + ` L ${px} ${py}`;
+            }
+            for (let j = steps; j >= 0; j--) {
+                let a = startAngle + (j / steps) * sweep;
+                let px = cx + Math.cos(a) * innerRadius;
+                let py = cy + Math.sin(a) * innerRadius;
+                path = path + ` L ${px} ${py}`;
+            }
+            path = path + " Z";
+        } else {
+            // Full wedge from center
+            path = `M ${cx} ${cy}`;
+            for (let j = 0; j <= steps; j++) {
+                let a = startAngle + (j / steps) * sweep;
+                let px = cx + Math.cos(a) * radius;
+                let py = cy + Math.sin(a) * radius;
+                path = path + ` L ${px} ${py}`;
+            }
+            path = path + " Z";
+        }
+
+        draw.path(path, color, 0, "", 0, 1);
+
+        // Label (skip if too small)
+        if (sweep >= 0.15) {
+            let midAngle = startAngle + sweep / 2;
+            let labelR = radius + 16;
+            let lx = cx + Math.cos(midAngle) * labelR;
+            let ly = cy + Math.sin(midAngle) * labelR;
+            draw.text(slice.label || "", lx - 15, ly - 5, 11, 400, _chartText,
+                _theme.fontFamily, 60, 1);
+        }
+
+        startAngle = startAngle + sweep;
+    }
+
+    // Center label (donut)
+    if (innerRadius > 0 && p.centerLabel) {
+        let textW = p.centerLabel.length * 11 * 0.55;
+        draw.text(p.centerLabel, cx - textW / 2, cy - 6, 11, 500, _chartText,
+            _theme.fontFamily, 100, 1);
+    }
+});
+
+// ─── GaugeChart ─────────────────────────────────────────────────────────────
+registerComponent("GaugeChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let w = cl.width;
+    let value = p.value !== undefined ? p.value : 0;
+    let label = p.label || "";
+
+    let cx = x0 + w / 2;
+    let cy = cl.y + w * 0.55;
+    let radius = w * 0.4;
+    let thickness = 10;
+
+    let fraction = Math.max(0, Math.min(1, value / 100));
+
+    // Color thresholds
+    let color;
+    if (value > 85) color = "rgba(240,69,69,1)";
+    else if (value > 60) color = "rgba(245,158,11,1)";
+    else color = "rgba(16,185,129,1)";
+
+    // Background arc (180 to 360 degrees)
+    let bgSteps = 32;
+    for (let i = 0; i < bgSteps; i++) {
+        let a1 = Math.PI + (i / bgSteps) * Math.PI;
+        let a2 = Math.PI + ((i + 1) / bgSteps) * Math.PI;
+        let path = _arcSegment(cx, cy, radius, thickness, a1, a2);
+        draw.path(path, "rgba(255,255,255,0.08)", 0, "", 0, 1);
+    }
+
+    // Value arc
+    let valSteps = Math.max(1, Math.round(bgSteps * fraction));
+    for (let i = 0; i < valSteps; i++) {
+        let a1 = Math.PI + (i / bgSteps) * Math.PI;
+        let a2 = Math.PI + ((i + 1) / bgSteps) * Math.PI;
+        let path = _arcSegment(cx, cy, radius, thickness, a1, a2);
+        draw.path(path, color, 0, "", 0, 1);
+    }
+
+    // Value text
+    let valText = Math.round(value) + "%";
+    let valW = valText.length * 18 * 0.55;
+    draw.text(valText, cx - valW / 2, cy - 14, 18, 700, "#ffffff",
+        _theme.fontFamily, 100, 1);
+
+    // Label
+    if (label) {
+        let labelW = label.length * 11 * 0.55;
+        draw.text(label, cx - labelW / 2, cy + 6, 11, 400, _chartText,
+            _theme.fontFamily, 100, 1);
+    }
+});
+
+// Helper: build a thick arc segment path (quad-like)
+function _arcSegment(cx, cy, radius, thickness, a1, a2) {
+    let outerR = radius;
+    let innerR = radius - thickness;
+    let ox1 = cx + Math.cos(a1) * outerR;
+    let oy1 = cy + Math.sin(a1) * outerR;
+    let ox2 = cx + Math.cos(a2) * outerR;
+    let oy2 = cy + Math.sin(a2) * outerR;
+    let ix1 = cx + Math.cos(a1) * innerR;
+    let iy1 = cy + Math.sin(a1) * innerR;
+    let ix2 = cx + Math.cos(a2) * innerR;
+    let iy2 = cy + Math.sin(a2) * innerR;
+    return `M ${ox1} ${oy1} L ${ox2} ${oy2} L ${ix2} ${iy2} L ${ix1} ${iy1} Z`;
+}
+
+// ─── RadarChart ─────────────────────────────────────────────────────────────
+registerComponent("RadarChart", (node, cl) => {
+    let p = node.props;
+    let x0 = cl.x;
+    let y0 = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+    let series = p.series || [];
+    if (series.length === 0) return;
+
+    let axes = series[0].data || [];
+    let nAxes = axes.length;
+    if (nAxes < 3) return;
+
+    let cx = x0 + w / 2;
+    let cy = y0 + h / 2;
+    let radius = Math.min(w, h) / 2 - 30;
+
+    // Grid rings
+    for (let ring = 1; ring <= 4; ring++) {
+        let r = radius * (ring / 4);
+        let gridPath = "";
+        for (let i = 0; i <= nAxes; i++) {
+            let idx = i % nAxes;
+            let angle = -Math.PI / 2 + 2 * Math.PI * (idx / nAxes);
+            let px = cx + Math.cos(angle) * r;
+            let py = cy + Math.sin(angle) * r;
+            if (i === 0) gridPath = `M ${px} ${py}`;
+            else gridPath = gridPath + ` L ${px} ${py}`;
+        }
+        draw.path(gridPath, "", 0, _chartGrid, 0.5, 1);
+    }
+
+    // Axis lines + labels
+    for (let i = 0; i < nAxes; i++) {
+        let angle = -Math.PI / 2 + 2 * Math.PI * (i / nAxes);
+        let ax = cx + Math.cos(angle) * radius;
+        let ay = cy + Math.sin(angle) * radius;
+        draw.line(cx, cy, ax, ay, _chartGrid, 0.5);
+
+        // Label
+        let lx = cx + Math.cos(angle) * (radius + 14);
+        let ly = cy + Math.sin(angle) * (radius + 14);
+        let label = axes[i].label || "";
+        draw.text(label, lx - 15, ly - 5, 10, 400, _chartText,
+            _theme.fontFamily, 60, 1);
+    }
+
+    // Data polygons
+    for (let s = 0; s < series.length; s++) {
+        let ser = series[s];
+        let data = ser.data || [];
+        let color = ser.color || _theme.primary;
+
+        let dataPath = "";
+        for (let i = 0; i <= nAxes; i++) {
+            let idx = i % nAxes;
+            let val = idx < data.length ? data[idx].value : 0;
+            let r = radius * Math.min(1, val / 100);
+            let angle = -Math.PI / 2 + 2 * Math.PI * (idx / nAxes);
+            let px = cx + Math.cos(angle) * r;
+            let py = cy + Math.sin(angle) * r;
+            if (i === 0) dataPath = `M ${px} ${py}`;
+            else dataPath = dataPath + ` L ${px} ${py}`;
+        }
+
+        // Fill
+        draw.path(dataPath, withAlpha(color, 0.15), 0, "", 0, 1);
+        // Stroke
+        draw.path(dataPath, "", 0, color, 1.5, 1);
+
+        // Dots
+        for (let i = 0; i < nAxes; i++) {
+            let val = i < data.length ? data[i].value : 0;
+            let r = radius * Math.min(1, val / 100);
+            let angle = -Math.PI / 2 + 2 * Math.PI * (i / nAxes);
+            let px = cx + Math.cos(angle) * r;
+            let py = cy + Math.sin(angle) * r;
+            draw.circle(px, py, 3, color, 0, "", 1);
+        }
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("LineChart", { width: "100%", height: 300, flexShrink: 0 });
+registerDefaultStyle("AreaChart", { width: "100%", height: 300, flexShrink: 0 });
+registerDefaultStyle("BarChart", { width: "100%", height: 300, flexShrink: 0 });
+registerDefaultStyle("PieChart", { width: 300, height: 300, flexShrink: 0 });
+registerDefaultStyle("GaugeChart", { width: 200, height: 120, flexShrink: 0 });
+registerDefaultStyle("RadarChart", { width: 300, height: 300, flexShrink: 0 });
+
+// ============================================================================
+// Data Components: Table, List, Pagination, TreeView
+// ============================================================================
+
+// ─── Table ──────────────────────────────────────────────────────────────────
+registerComponent("Table", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let columns = p.columns || [];
+    let rows = p.rows || [];
+    let bg = p.background || "rgba(22,22,26,1)";
+    let headerBg = p.headerBackground || "rgba(30,30,38,1)";
+    let color = p.color || "rgba(230,230,230,1)";
+    let borderColor = p.borderColor || "rgba(255,255,255,0.06)";
+    let fontSize = p.fontSize || 13;
+    let rowHeight = p.rowHeight || 40;
+    let headerHeight = p.headerHeight || 44;
+    let striped = p.striped || false;
+
+    if (columns.length === 0) {
+        let msg = p.emptyMessage || "No data";
+        draw.text(msg, x + 16, y + 20, 14, 400, withAlpha(color, 0.5),
+            _theme.fontFamily, w - 32, 1);
+        return;
+    }
+
+    // Background
+    draw.roundedRect(x, y, w, h, bg, 8, 0, "", 1);
+
+    let colW = w / columns.length;
+
+    // Header
+    draw.rect(x, y, w, headerHeight, headerBg, 0, 0, "", 1);
+    for (let c = 0; c < columns.length; c++) {
+        let col = columns[c];
+        let textX = x + c * colW + 12;
+        let textY = y + (headerHeight - fontSize * 1.2) / 2;
+        draw.text(col.header || col.key || "", textX, textY, fontSize, 600, color,
+            _theme.fontFamily, colW - 24, 1);
+    }
+
+    // Header border
+    draw.line(x, y + headerHeight, x + w, y + headerHeight, borderColor, 1);
+
+    // Rows
+    for (let r = 0; r < rows.length; r++) {
+        let ry = y + headerHeight + r * rowHeight;
+        if (ry + rowHeight > y + h) break;
+
+        // Stripe
+        if (striped && r % 2 === 1) {
+            draw.rect(x, ry, w, rowHeight, "rgba(255,255,255,0.02)", 0, 0, "", 1);
+        }
+
+        let cells = rows[r].cells || [];
+        for (let c = 0; c < columns.length; c++) {
+            let cellText = c < cells.length ? cells[c] : "";
+            let textX = x + c * colW + 12;
+            let textY = ry + (rowHeight - fontSize * 1.2) / 2;
+            draw.text(cellText, textX, textY, fontSize, 400,
+                withAlpha(color, 0.8), _theme.fontFamily, colW - 24, 1);
+        }
+
+        // Row border
+        if (r < rows.length - 1) {
+            draw.line(x, ry + rowHeight, x + w, ry + rowHeight, borderColor, 0.5);
+        }
+    }
+});
+
+// ─── List ───────────────────────────────────────────────────────────────────
+registerComponent("List", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let items = p.items || [];
+    let bg = p.background;
+    let color = p.color || "rgba(230,230,230,1)";
+    let fontSize = p.fontSize || 14;
+    let itemPadding = p.itemPadding || 8;
+    let dividers = p.dividers || false;
+
+    if (bg) {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    if (items.length === 0) {
+        let msg = p.emptyMessage || "No items";
+        draw.text(msg, x + 12, y + 12, 14, 400, withAlpha(color, 0.5),
+            _theme.fontFamily, w - 24, 1);
+        return;
+    }
+
+    let itemH = fontSize * 1.4 + itemPadding * 2;
+
+    for (let i = 0; i < items.length; i++) {
+        let item = items[i];
+        let iy = y + i * itemH;
+        if (iy + itemH > y + h) break;
+
+        // Primary text
+        let textY = iy + itemPadding;
+        draw.text(item.primary || "", x + 12, textY, fontSize, 400, color,
+            _theme.fontFamily, w - 24, 1);
+
+        // Secondary text
+        if (item.secondary) {
+            let secY = textY + fontSize * 1.3;
+            draw.text(item.secondary, x + 12, secY, fontSize * 0.85, 400,
+                withAlpha(color, 0.5), _theme.fontFamily, w - 24, 1);
+        }
+
+        // Divider
+        if (dividers && i < items.length - 1) {
+            draw.line(x, iy + itemH, x + w, iy + itemH, "rgba(255,255,255,0.06)", 0.5);
+        }
+    }
+});
+
+// ─── Pagination ─────────────────────────────────────────────────────────────
+registerComponent("Pagination", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let current = p.current || 1;
+    let totalPages = p.totalPages || 1;
+    let color = p.color || "rgba(161,161,170,1)";
+    let activeColor = p.activeColor || _theme.primary;
+    let br = p.borderRadius || 6;
+
+    let btnSize = 32;
+    let gap = 4;
+    let maxButtons = Math.min(totalPages, 7);
+    let totalW = maxButtons * btnSize + (maxButtons - 1) * gap;
+    let startX = x + (w - totalW) / 2;
+
+    for (let i = 1; i <= maxButtons; i++) {
+        let bx = startX + (i - 1) * (btnSize + gap);
+        let by = y + (h - btnSize) / 2;
+        let isActive = i === current;
+
+        if (isActive) {
+            draw.roundedRect(bx, by, btnSize, btnSize, activeColor, br, 0, "", 1);
+        }
+
+        let label = i.toString();
+        let textW = label.length * 9 * 0.55;
+        let textX = bx + (btnSize - textW) / 2;
+        let textY = by + (btnSize - 12 * 1.2) / 2;
+        let textColor = isActive ? "#ffffff" : color;
+
+        draw.text(label, textX, textY, 12, 500, textColor,
+            _theme.fontFamily, btnSize, 1);
+    }
+});
+
+// ─── TreeView ───────────────────────────────────────────────────────────────
+registerComponent("TreeView", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let nodes = p.nodes || [];
+    let bg = p.background;
+    let color = p.color || "rgba(230,230,230,1)";
+    let indent = p.indent || 24;
+    let showLines = p.showLines || false;
+    let fontSize = p.fontSize || 14;
+
+    if (bg) {
+        draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+    }
+
+    let rowH = 32;
+
+    for (let i = 0; i < nodes.length; i++) {
+        let n = nodes[i];
+        let ry = y + i * rowH;
+        if (ry + rowH > y + h) break;
+
+        let depth = n.depth || 0;
+        let ix = x + depth * indent + 8;
+
+        // Connector lines
+        if (showLines && depth > 0) {
+            let lineX = x + (depth - 0.5) * indent + 8;
+            draw.line(lineX, ry, lineX, ry + rowH, "rgba(255,255,255,0.1)", 0.5);
+        }
+
+        // Expand/collapse arrow
+        if (n.hasChildren) {
+            let arrowX = ix - 12;
+            let arrowY = ry + rowH / 2;
+            if (n.expanded) {
+                // V shape (pointing down)
+                let arrowPath = `M ${arrowX - 3} ${arrowY - 2} L ${arrowX} ${arrowY + 2} L ${arrowX + 3} ${arrowY - 2}`;
+                draw.path(arrowPath, "", 0, withAlpha(color, 0.5), 1.5, 1);
+            } else {
+                // > shape (pointing right)
+                let arrowPath = `M ${arrowX - 2} ${arrowY - 3} L ${arrowX + 2} ${arrowY} L ${arrowX - 2} ${arrowY + 3}`;
+                draw.path(arrowPath, "", 0, withAlpha(color, 0.5), 1.5, 1);
+            }
+        }
+
+        // Label
+        let textY = ry + (rowH - fontSize * 1.2) / 2;
+        draw.text(n.label || "", ix, textY, fontSize, 400, color,
+            _theme.fontFamily, w - ix + x, 1);
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("Table", {
+    width: "100%",
+    flexShrink: 0
+});
+
+registerDefaultStyle("List", {
+    width: "100%"
+});
+
+registerDefaultStyle("Pagination", {
+    display: "flex",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "100%",
+    height: 48,
+    flexShrink: 0
+});
+
+registerDefaultStyle("TreeView", {
+    width: "100%"
+});
+
+// ============================================================================
+// Smart Components: SmartGrid, SmartForm, SmartView, SmartStats, SmartCards,
+//                   SmartList, SmartTimeline
+// ============================================================================
+
+// ─── SmartGrid ──────────────────────────────────────────────────────────────
+registerComponent("SmartGrid", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let columns = p.columns || [];
+    let rows = p.rows || [];
+    let bg = p.background || "rgba(22,22,26,1)";
+    let headerBg = p.headerBackground || "rgba(30,30,38,1)";
+    let color = p.color || "rgba(230,230,230,1)";
+    let borderColor = p.borderColor || "rgba(255,255,255,0.06)";
+    let fontSize = p.fontSize || 13;
+    let searchable = p.searchable || false;
+    let pageable = p.pageable || false;
+    let pageSize = p.pageSize || 10;
+
+    // Container
+    draw.roundedRect(x, y, w, h, bg, 8, 1, borderColor, 1);
+
+    let currentY = y;
+
+    // Search bar
+    if (searchable) {
+        draw.roundedRect(x + 8, currentY + 8, w - 16, 28, "rgba(255,255,255,0.04)", 6, 0, "", 1);
+        draw.text("Search...", x + 16, currentY + 14, 12, 400,
+            withAlpha(color, 0.4), _theme.fontFamily, w - 32, 1);
+        currentY = currentY + 40;
+    }
+
+    if (columns.length === 0) {
+        draw.text(p.emptyMessage || "No data", x + 16, currentY + 20, 14, 400,
+            withAlpha(color, 0.5), _theme.fontFamily, w - 32, 1);
+        return;
+    }
+
+    let colW = w / columns.length;
+
+    // Header
+    draw.rect(x, currentY, w, 44, headerBg, 0, 0, "", 1);
+    for (let c = 0; c < columns.length; c++) {
+        let col = columns[c];
+        let textX = x + c * colW + 12;
+        let textY = currentY + (44 - fontSize * 1.2) / 2;
+        draw.text(col.header || col.key || "", textX, textY, fontSize, 600, color,
+            _theme.fontFamily, colW - 24, 1);
+    }
+    currentY = currentY + 44;
+
+    // Rows
+    let displayRows = pageable ? rows.slice(0, pageSize) : rows;
+    for (let r = 0; r < displayRows.length; r++) {
+        let ry = currentY + r * 40;
+        if (ry + 40 > y + h - 30) break;
+
+        // Stripe
+        if (r % 2 === 1) {
+            draw.rect(x, ry, w, 40, "rgba(255,255,255,0.02)", 0, 0, "", 1);
+        }
+
+        let cells = displayRows[r].cells || [];
+        for (let c = 0; c < columns.length; c++) {
+            let cellText = c < cells.length ? cells[c] : "";
+            let textX = x + c * colW + 12;
+            let textY = ry + (40 - fontSize * 1.2) / 2;
+            draw.text(cellText, textX, textY, fontSize, 400,
+                withAlpha(color, 0.8), _theme.fontFamily, colW - 24, 1);
+        }
+    }
+
+    // Pagination info
+    if (pageable && rows.length > 0) {
+        let totalPages = Math.ceil(rows.length / pageSize);
+        let shown = Math.min(pageSize, rows.length);
+        let infoText = `Showing 1-${shown} of ${rows.length} (${totalPages} pages)`;
+        let infoY = y + h - 24;
+        draw.text(infoText, x + 12, infoY, 11, 400,
+            withAlpha(color, 0.5), _theme.fontFamily, w - 24, 1);
+    }
+});
+
+// ─── SmartForm ──────────────────────────────────────────────────────────────
+registerComponent("SmartForm", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let fields = p.fields || [];
+    let bg = p.background || "rgba(22,22,26,1)";
+    let color = p.color || "rgba(230,230,230,1)";
+    let accentColor = p.accentColor || _theme.primary;
+    let columns = p.columns || 1;
+    let br = 12;
+
+    // Container
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    let currentY = y + 16;
+
+    // Title
+    if (p.title) {
+        draw.text(p.title, x + 16, currentY, 18, 600, color,
+            _theme.fontFamily, w - 32, 1);
+        currentY = currentY + 28;
+    }
+
+    // Description
+    if (p.description) {
+        draw.text(p.description, x + 16, currentY, 13, 400,
+            withAlpha(color, 0.6), _theme.fontFamily, w - 32, 1);
+        currentY = currentY + 24;
+    }
+
+    // Fields grid
+    let fieldW = (w - 32 - (columns - 1) * 12) / columns;
+    let fieldH = 64;
+
+    for (let i = 0; i < fields.length; i++) {
+        let field = fields[i];
+        let col = i % columns;
+        let row = Math.floor(i / columns);
+        let fx = x + 16 + col * (fieldW + 12);
+        let fy = currentY + row * fieldH;
+
+        // Label
+        draw.text(field.label || field.name || "", fx, fy, 13, 500,
+            withAlpha(color, 0.7), _theme.fontFamily, fieldW, 1);
+
+        // Input box
+        let inputY = fy + 20;
+        draw.roundedRect(fx, inputY, fieldW, 36, "rgba(255,255,255,0.04)", 6,
+            0.5, "rgba(255,255,255,0.1)", 1);
+
+        // Placeholder
+        if (field.placeholder) {
+            draw.text(field.placeholder, fx + 10, inputY + 10, 13, 400,
+                withAlpha(color, 0.35), _theme.fontFamily, fieldW - 20, 1);
+        }
+    }
+
+    // Submit button
+    let totalRows = Math.ceil(fields.length / columns);
+    let btnY = currentY + totalRows * fieldH + 12;
+    let submitText = p.submitText || "Submit";
+    let btnW = 120;
+    let btnH = 36;
+
+    draw.roundedRect(x + 16, btnY, btnW, btnH, accentColor, 8, 0, "", 1);
+    let stW = submitText.length * 13 * 0.55;
+    draw.text(submitText, x + 16 + (btnW - stW) / 2, btnY + (btnH - 13 * 1.2) / 2,
+        13, 500, "#ffffff", _theme.fontFamily, btnW, 1);
+
+    // Cancel text
+    if (p.showCancel && p.cancelText) {
+        draw.text(p.cancelText, x + 16 + btnW + 16, btnY + (btnH - 13 * 1.2) / 2,
+            13, 400, withAlpha(color, 0.6), _theme.fontFamily, 100, 1);
+    }
+});
+
+// ─── SmartView ──────────────────────────────────────────────────────────────
+registerComponent("SmartView", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let fields = p.fields || [];
+    let bg = p.background || "rgba(22,22,26,1)";
+    let color = p.color || "rgba(230,230,230,1)";
+    let labelColor = p.labelColor || withAlpha(color, 0.5);
+    let br = p.borderRadius || 8;
+    let showLabels = p.showLabels !== false;
+
+    draw.roundedRect(x, y, w, h, bg, br, 0, "", 1);
+
+    let currentY = y + 16;
+
+    // Title
+    if (p.title) {
+        draw.text(p.title, x + 16, currentY, 16, 600, color,
+            _theme.fontFamily, w - 32, 1);
+        currentY = currentY + 28;
+    }
+
+    // Fields
+    for (let i = 0; i < fields.length; i++) {
+        let field = fields[i];
+        let fy = currentY + i * 24;
+        if (fy + 24 > y + h) break;
+
+        if (showLabels) {
+            draw.text(field.label || "", x + 16, fy, 13, 400, labelColor,
+                _theme.fontFamily, w * 0.38, 1);
+            draw.text(field.value || "", x + w * 0.4, fy, 13, 400, color,
+                _theme.fontFamily, w * 0.56, 1);
+        } else {
+            draw.text(field.value || "", x + 16, fy, 13, 400, color,
+                _theme.fontFamily, w - 32, 1);
+        }
+    }
+});
+
+// ─── SmartStats ─────────────────────────────────────────────────────────────
+registerComponent("SmartStats", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let stats = p.stats || [];
+    if (stats.length === 0) return;
+
+    let columns = p.columns || Math.min(stats.length, 4);
+    let variant = p.variant || "default";
+    let color = p.color || "rgba(230,230,230,1)";
+    let br = p.borderRadius || 8;
+    let gap = 12;
+
+    let cardW = (w - gap * (columns - 1)) / columns;
+    let cardH = 96;
+
+    for (let i = 0; i < stats.length; i++) {
+        let stat = stats[i];
+        let col = i % columns;
+        let row = Math.floor(i / columns);
+        let cx = x + col * (cardW + gap);
+        let cy = y + row * (cardH + gap);
+
+        // Card background
+        if (variant === "outline") {
+            draw.roundedRect(cx, cy, cardW, cardH, "", br, 1,
+                "rgba(255,255,255,0.1)", 1);
+        } else if (variant !== "minimal") {
+            draw.roundedRect(cx, cy, cardW, cardH, "rgba(255,255,255,0.04)",
+                br, 0, "", 1);
+        }
+
+        // Value
+        draw.text(stat.value || "0", cx + 16, cy + 20, 24, 700, color,
+            _theme.fontFamily, cardW - 32, 1);
+
+        // Label
+        draw.text(stat.label || "", cx + 16, cy + 52, 12, 400,
+            withAlpha(color, 0.6), _theme.fontFamily, cardW - 32, 1);
+
+        // Trend
+        if (stat.trend) {
+            let trendColor = stat.trendUp ? "#22c55e" : "#ef4444";
+            draw.text(stat.trend, cx + cardW - 48, cy + 8, 11, 500, trendColor,
+                _theme.fontFamily, 40, 1);
+        }
+    }
+});
+
+// ─── SmartCards ──────────────────────────────────────────────────────────────
+registerComponent("SmartCards", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let cards = p.cards || [];
+    let columns = p.columns || 3;
+    let color = p.color || "rgba(230,230,230,1)";
+    let cardBg = p.cardBackground || "rgba(22,22,26,1)";
+    let br = p.borderRadius || 8;
+    let searchable = p.searchable || false;
+    let gap = 12;
+
+    let startY = y;
+    if (searchable) {
+        draw.roundedRect(x, y + 4, w, 32, "rgba(255,255,255,0.04)", 6, 0, "", 1);
+        draw.text("Search...", x + 12, y + 12, 12, 400,
+            withAlpha(color, 0.4), _theme.fontFamily, w - 24, 1);
+        startY = startY + 48;
+    }
+
+    if (cards.length === 0) {
+        draw.text(p.emptyMessage || "No cards", x + 12, startY + 12, 14, 400,
+            withAlpha(color, 0.5), _theme.fontFamily, w - 24, 1);
+        return;
+    }
+
+    let cardW = (w - gap * (columns - 1)) / columns;
+    let cardH = 148;
+
+    for (let i = 0; i < cards.length; i++) {
+        let card = cards[i];
+        let col = i % columns;
+        let row = Math.floor(i / columns);
+        let cx = x + col * (cardW + gap);
+        let cy = startY + row * (cardH + gap);
+
+        if (cy + cardH > y + h) break;
+
+        // Card
+        draw.roundedRect(cx, cy, cardW, cardH, cardBg, br,
+            0.5, "rgba(255,255,255,0.06)", 1);
+
+        // Title
+        if (card.title) {
+            draw.text(card.title, cx + 16, cy + 16, 15, 600, color,
+                _theme.fontFamily, cardW - 32, 1);
+        }
+
+        // Subtitle
+        if (card.subtitle) {
+            draw.text(card.subtitle, cx + 16, cy + 38, 12, 400,
+                withAlpha(color, 0.6), _theme.fontFamily, cardW - 32, 1);
+        }
+
+        // Description
+        if (card.description) {
+            draw.text(card.description, cx + 16, cy + 60, 13, 400,
+                withAlpha(color, 0.7), _theme.fontFamily, cardW - 32, 1);
+        }
+    }
+});
+
+// ─── SmartList ──────────────────────────────────────────────────────────────
+registerComponent("SmartList", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let rows = p.rows || [];
+    let bg = p.background;
+    let color = p.color || "rgba(230,230,230,1)";
+    let dividers = p.dividers || false;
+    let variant = p.variant || "default";
+    let maxItems = p.maxItems || 999;
+
+    if (bg) draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+
+    let avatarColors = ["#6366f1", "#8b5cf6", "#06b6d4", "#f59e0b", "#10b981"];
+    let itemH = variant === "compact" ? 40 : 56;
+    let avatarSize = variant === "compact" ? 28 : 36;
+
+    if (rows.length === 0) {
+        draw.text(p.emptyMessage || "No items", x + 12, y + 12, 14, 400,
+            withAlpha(color, 0.5), _theme.fontFamily, w - 24, 1);
+        return;
+    }
+
+    let count = Math.min(rows.length, maxItems);
+    for (let i = 0; i < count; i++) {
+        let row = rows[i];
+        let iy = y + i * itemH;
+        if (iy + itemH > y + h) break;
+
+        // Avatar
+        let avatarColor = avatarColors[i % avatarColors.length];
+        let avatarX = x + 12;
+        let avatarY = iy + (itemH - avatarSize) / 2;
+        let avatarR = avatarSize / 2;
+        draw.circle(avatarX + avatarR, avatarY + avatarR, avatarR, avatarColor, 0, "", 1);
+
+        // Initials
+        let initials = row.avatarInitials || "";
+        if (initials) {
+            let fontSize = avatarSize * 0.4;
+            let iW = initials.length * fontSize * 0.6;
+            draw.text(initials, avatarX + (avatarSize - iW) / 2,
+                avatarY + (avatarSize - fontSize) / 2,
+                fontSize, 700, "#ffffff", _theme.fontFamily, avatarSize, 1);
+        }
+
+        // Text start
+        let textX = avatarX + avatarSize + 10;
+        let textMaxW = w - textX + x;
+
+        // Primary
+        let primaryY = row.secondary ? (iy + itemH * 0.25) : (iy + (itemH - 14 * 1.2) / 2);
+        draw.text(row.primary || "", textX, primaryY, 14, 500, color,
+            _theme.fontFamily, textMaxW - 60, 1);
+
+        // Badge
+        if (row.badge) {
+            let badgeX = textX;
+            let measured = draw.measureText(row.primary || "", 14, 500, _theme.fontFamily, 0);
+            if (measured) badgeX = badgeX + measured.width + 8;
+            draw.roundedRect(badgeX, primaryY, 40, 18, withAlpha(avatarColor, 0.2), 9, 0, "", 1);
+            draw.text(row.badge, badgeX + 6, primaryY + 2, 10, 500, avatarColor,
+                _theme.fontFamily, 28, 1);
+        }
+
+        // Secondary
+        if (row.secondary) {
+            let secY = iy + itemH * 0.55;
+            draw.text(row.secondary, textX, secY, 12, 400,
+                withAlpha(color, 0.5), _theme.fontFamily, textMaxW, 1);
+        }
+
+        // Tertiary (right-aligned)
+        if (row.tertiary) {
+            let terY = iy + (itemH - 12 * 1.2) / 2;
+            let measured = draw.measureText(row.tertiary, 12, 400, _theme.fontFamily, 0);
+            let terW = measured ? measured.width : (row.tertiary.length * 12 * 0.55);
+            draw.text(row.tertiary, x + w - terW - 12, terY, 12, 400,
+                withAlpha(color, 0.5), _theme.fontFamily, terW + 4, 1);
+        }
+
+        // Divider
+        if (dividers && i < count - 1) {
+            draw.line(x, iy + itemH, x + w, iy + itemH, "rgba(255,255,255,0.06)", 0.5);
+        }
+    }
+});
+
+// ─── SmartTimeline ──────────────────────────────────────────────────────────
+registerComponent("SmartTimeline", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let events = p.events || [];
+    let bg = p.background;
+    let color = p.color || "rgba(230,230,230,1)";
+    let showLine = p.showLine !== false;
+    let variant = p.variant || "default";
+    let maxItems = p.maxItems || 999;
+
+    if (bg) draw.rect(x, y, w, h, bg, 0, 0, "", 1);
+
+    let eventH = variant === "compact" ? 52 : 72;
+    let dotR = 6;
+
+    if (events.length === 0) {
+        draw.text(p.emptyMessage || "No events", x + 12, y + 12, 14, 400,
+            withAlpha(color, 0.5), _theme.fontFamily, w - 24, 1);
+        return;
+    }
+
+    let count = Math.min(events.length, maxItems);
+    for (let i = 0; i < count; i++) {
+        let evt = events[i];
+        let ey = y + i * eventH;
+        if (ey + eventH > y + h) break;
+
+        let dotX = x + 20;
+        let dotY = ey + dotR + 8;
+
+        // Connecting line
+        if (showLine && i < count - 1) {
+            draw.line(dotX, dotY + dotR, dotX, ey + eventH, "rgba(255,255,255,0.08)", 1);
+        }
+
+        // Status dot
+        let statusBg = evt.statusBg || "rgba(99,102,241,0.2)";
+        let statusColor = evt.statusColor || "#6366f1";
+        draw.circle(dotX, dotY, dotR, statusBg, 1.5, statusColor, 1);
+
+        // Text
+        let textX = dotX + dotR + 16;
+        let textMaxW = w - textX + x;
+
+        // Title
+        draw.text(evt.title || "", textX, ey + 8, 14, 500, color,
+            _theme.fontFamily, textMaxW - 80, 1);
+
+        // Time (right-aligned)
+        if (evt.time) {
+            let measured = draw.measureText(evt.time, 11, 400, _theme.fontFamily, 0);
+            let timeW = measured ? measured.width : (evt.time.length * 11 * 0.55);
+            draw.text(evt.time, x + w - timeW - 8, ey + 10, 11, 400,
+                withAlpha(color, 0.5), _theme.fontFamily, timeW + 4, 1);
+        }
+
+        // Description
+        if (evt.description) {
+            draw.text(evt.description, textX, ey + 28, 12, 400,
+                withAlpha(color, 0.6), _theme.fontFamily, textMaxW, 1);
+        }
+
+        // Actor
+        if (evt.actor) {
+            let actorY = evt.description ? ey + 46 : ey + 28;
+            draw.circle(textX + 6, actorY + 6, 6, "#6366f1", 0, "", 1);
+            draw.text(evt.actor, textX + 18, actorY, 11, 400,
+                withAlpha(color, 0.6), _theme.fontFamily, textMaxW - 18, 1);
+        }
+    }
+});
+
+// ─── Default styles ─────────────────────────────────────────────────────────
+
+registerDefaultStyle("SmartGrid", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartForm", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartView", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartStats", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartCards", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartList", { width: "100%", flexShrink: 0 });
+registerDefaultStyle("SmartTimeline", { width: "100%", flexShrink: 0 });
+
+// ============================================================================
+// Animation Components: AnimatedNumber, AnimatedBox, Typewriter, Marquee
+// ============================================================================
+
+// ─── AnimatedNumber ─────────────────────────────────────────────────────────
+// Counts from 0 to a target value over ~1 second with cubic ease-out.
+registerComponent("AnimatedNumber", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let value = p.value || 0;
+    let prefix = p.prefix || "";
+    let suffix = p.suffix || "";
+    let separator = p.separator || false;
+    let decimals = p.decimals || 0;
+    let color = p.color || "#fafafa";
+    let fontSize = p.fontSize || 32;
+    let fontWeight = p.fontWeight || 700;
+
+    // Animate: count from 0 to value over 1 second
+    let animDuration = p.duration || 1.0;
+    let elapsed = input.getPageElapsedSecs();
+    let progress = Math.min(elapsed / animDuration, 1.0);
+    // Ease-out cubic: t = 1 - (1 - progress)^3
+    let t = 1.0 - (1.0 - progress) * (1.0 - progress) * (1.0 - progress);
+    let currentValue = value * t;
+
+    // Format the number
+    let formatted;
+    if (decimals > 0) {
+        // toFixed-like: multiply, round, re-divide
+        let factor = Math.pow(10, decimals);
+        let rounded = Math.round(currentValue * factor) / factor;
+        formatted = "" + rounded;
+        // Ensure we have enough decimal places
+        let dotIdx = formatted.indexOf(".");
+        if (dotIdx < 0) {
+            formatted = formatted + ".";
+            dotIdx = formatted.length - 1;
+        }
+        let currentDecimals = formatted.length - dotIdx - 1;
+        while (currentDecimals < decimals) {
+            formatted = formatted + "0";
+            currentDecimals = currentDecimals + 1;
+        }
+    } else {
+        formatted = "" + Math.round(currentValue);
+    }
+
+    // Add thousand separators
+    if (separator) {
+        formatted = _addThousandSeparator(formatted);
+    }
+
+    let displayText = prefix + formatted + suffix;
+
+    let textY = y + (h - fontSize * 1.2) / 2;
+    draw.text(displayText, x, textY, fontSize, fontWeight, color,
+        _theme.fontFamily, w, 1);
+
+    // Keep requesting redraw while animating
+    if (progress < 1.0) {
+        input.requestRedraw();
+    }
+});
+
+function _addThousandSeparator(str) {
+    let dotIdx = str.indexOf(".");
+    let intPart;
+    let decPart = "";
+    if (dotIdx >= 0) {
+        intPart = str.substring(0, dotIdx);
+        decPart = str.substring(dotIdx);
+    } else {
+        intPart = str;
+    }
+
+    // Handle negative
+    let neg = false;
+    if (intPart.charAt(0) === "-") {
+        neg = true;
+        intPart = intPart.substring(1);
+    }
+
+    let result = "";
+    let count = 0;
+    for (let i = intPart.length - 1; i >= 0; i--) {
+        if (count > 0 && count % 3 === 0) {
+            result = "," + result;
+        }
+        result = intPart.charAt(i) + result;
+        count = count + 1;
+    }
+
+    if (neg) result = "-" + result;
+    return result + decPart;
+}
+
+// ─── AnimatedBox ────────────────────────────────────────────────────────────
+// Container with entrance animations (fade, slide, scale, bounce).
+registerComponent("AnimatedBox", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let animation = p.animation || "fadeIn";
+    let durationMs = p.durationMs || 500;
+    let delayMs = p.delayMs || 0;
+    let background = p.background || "";
+    let borderRadius = p.borderRadius || 0;
+    let baseOpacity = p.opacity !== undefined ? p.opacity : 1.0;
+    let trigger = p.trigger || "visible";
+
+    if (trigger === "hover") {
+        // Hover mode: render static background, animations applied to children
+        if (background) {
+            draw.roundedRect(x, y, w, h, background, borderRadius, 0, "", baseOpacity);
+        }
+        return;
+    }
+
+    // Entrance animation (visible trigger)
+    let pageElapsed = input.getPageElapsedSecs();
+    let delaySecs = delayMs / 1000;
+    let durationSecs = durationMs / 1000;
+    let tRaw = Math.min(Math.max((pageElapsed - delaySecs) / durationSecs, 0), 1);
+    // Ease-out cubic
+    let t = 1.0 - (1.0 - tRaw) * (1.0 - tRaw) * (1.0 - tRaw);
+    let opacity = t * baseOpacity;
+
+    if (opacity <= 0 && !background) return;
+
+    // Compute entrance offset
+    let offsetX = 0;
+    let offsetY = 0;
+    if (animation === "fadeUp" || animation === "slideUp") {
+        offsetY = 20 * (1 - t);
+    } else if (animation === "fadeDown") {
+        offsetY = -20 * (1 - t);
+    } else if (animation === "fadeLeft") {
+        offsetX = 20 * (1 - t);
+    } else if (animation === "fadeRight") {
+        offsetX = -20 * (1 - t);
+    }
+
+    // Apply transform for offset
+    if (offsetX !== 0 || offsetY !== 0) {
+        draw.pushTransform(offsetX, offsetY, 1, 1, 0);
+    }
+
+    if (background) {
+        draw.roundedRect(x, y, w, h, background, borderRadius, 0, "", opacity);
+    }
+
+    // Render children with opacity
+    if (opacity < 1) {
+        draw.pushOpacity(opacity);
+    }
+
+    // Note: children are rendered by the runtime renderTree after this returns.
+    // We apply transforms that will affect children too.
+
+    if (opacity < 1) {
+        // We need to pop opacity after children render.
+        // Store state on node for post-render cleanup.
+        node._animOpacityPushed = true;
+    }
+
+    if (offsetX !== 0 || offsetY !== 0) {
+        node._animTransformPushed = true;
+    }
+
+    // Keep requesting redraw while animating
+    if (tRaw < 1.0) {
+        input.requestRedraw();
+    }
+});
+
+// ─── Typewriter ─────────────────────────────────────────────────────────────
+// Types text character by character, then deletes it, cycling through strings.
+registerComponent("Typewriter", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let texts = p.texts || [];
+    if (texts.length === 0) return;
+
+    let cursorChar = p.cursorChar || "|";
+    let color = p.color || "#fafafa";
+    let fontSize = p.fontSize || 16;
+    let fontWeight = p.fontWeight || 400;
+
+    let typeSpeed = 0.06;    // seconds per character
+    let deleteSpeed = 0.025; // seconds per character
+    let pauseDuration = 2.0; // seconds to pause at full text
+
+    let elapsed = input.getElapsedSecs();
+
+    // Calculate cycle time based on first text length
+    let firstText = texts[0];
+    let typeTime = firstText.length * typeSpeed;
+    let cycleTime = typeTime + pauseDuration + firstText.length * deleteSpeed + 0.5;
+
+    let totalTexts = texts.length;
+    let totalCycle = cycleTime * totalTexts;
+    let cycleElapsed = elapsed % totalCycle;
+    let textIdx = Math.floor(cycleElapsed / cycleTime) % totalTexts;
+    let withinCycle = cycleElapsed - textIdx * cycleTime;
+
+    let currentText = texts[textIdx];
+    let charCount = currentText.length;
+    let typePhase = charCount * typeSpeed;
+
+    let visibleChars;
+    if (withinCycle < typePhase) {
+        // Typing phase
+        visibleChars = Math.floor(withinCycle / typeSpeed);
+    } else if (withinCycle < typePhase + pauseDuration) {
+        // Pause phase - full text visible
+        visibleChars = charCount;
+    } else {
+        // Delete phase
+        let deleteElapsed = withinCycle - typePhase - pauseDuration;
+        let deleted = Math.floor(deleteElapsed / deleteSpeed);
+        visibleChars = Math.max(charCount - deleted, 0);
+    }
+
+    let visible = currentText.substring(0, visibleChars);
+
+    // Blinking cursor (2 Hz)
+    let cursorVisible = (elapsed * 2) % 1 < 0.5;
+    let displayText;
+    if (cursorVisible) {
+        displayText = visible + cursorChar;
+    } else {
+        displayText = visible + " ";
+    }
+
+    let textY = y + (h - fontSize * 1.2) / 2;
+    draw.text(displayText, x, textY, fontSize, fontWeight, color,
+        _theme.fontFamily, w, 1);
+
+    // Always request redraw for continuous animation
+    input.requestRedraw();
+});
+
+// ─── Marquee ────────────────────────────────────────────────────────────────
+// Scrolls child content continuously to the left. Rendered twice for seamless loop.
+registerComponent("Marquee", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let speed = p.speed || 50;
+    let gap = p.gap || 20;
+
+    if (speed < 10) speed = 10;
+
+    // The Marquee component's children are rendered by renderTree normally,
+    // but we need to handle the scrolling offset. We compute the content width
+    // from children layout and apply a scrolling clip + transform.
+
+    // Calculate content width from children
+    let contentWidth = 0;
+    for (let i = 0; i < node.children.length; i++) {
+        let child = node.children[i];
+        if (child._computedLayout) {
+            let childRight = child._computedLayout.x + child._computedLayout.width - x;
+            if (childRight > contentWidth) contentWidth = childRight;
+        }
+    }
+    if (contentWidth < w) contentWidth = w;
+    let totalWidth = contentWidth + gap;
+
+    let elapsed = input.getElapsedSecs();
+    let rawOffset = (elapsed * speed) % totalWidth;
+    let offset = -rawOffset;
+
+    // Clip to the marquee bounds
+    draw.pushClip(x, y, w, h, 0);
+
+    // First copy: offset
+    draw.pushTransform(offset, 0, 1, 1, 0);
+    for (let i = 0; i < node.children.length; i++) {
+        renderTree(node.children[i]);
+    }
+    draw.popTransform();
+
+    // Second copy: offset + totalWidth (seamless loop)
+    draw.pushTransform(offset + totalWidth, 0, 1, 1, 0);
+    for (let i = 0; i < node.children.length; i++) {
+        renderTree(node.children[i]);
+    }
+    draw.popTransform();
+
+    draw.popClip();
+
+    // Prevent default child rendering by marking children as already rendered
+    node._childrenRendered = true;
+
+    // Always request redraw for continuous animation
+    input.requestRedraw();
+});
+
+// ============================================================================
+// Interactive Components: SortableList, Draggable
+// ============================================================================
+
+// ─── SortableList ───────────────────────────────────────────────────────────
+// A list of items that can be reordered by dragging. Each item shows a grip
+// handle, primary text, and optional secondary text.
+registerComponent("SortableList", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let items = p.items || [];
+    let itemGap = p.gap || 4;
+    let itemHeight = p.itemHeight || 40;
+    let stride = itemHeight + itemGap;
+
+    // Drag state: { listIndex, itemIndex, offsetY }
+    let dragState = getState("_sortDrag_" + (p.id || "default"), null);
+
+    // First pass: render non-dragged items (shift to make room for dragged)
+    for (let i = 0; i < items.length; i++) {
+        let isDragged = dragState && dragState.itemIndex === i;
+        if (isDragged) continue;
+
+        let visualY;
+        if (dragState) {
+            let dragIdx = dragState.itemIndex;
+            let draggedVisualPos = dragIdx * stride + dragState.offsetY;
+            let targetSlot = Math.round(draggedVisualPos / stride);
+            targetSlot = Math.max(0, Math.min(targetSlot, items.length - 1));
+            let baseY = i * stride;
+
+            if (i < dragIdx && i >= targetSlot) {
+                visualY = baseY + stride;  // Shift down
+            } else if (i > dragIdx && i <= targetSlot) {
+                visualY = baseY - stride;  // Shift up
+            } else {
+                visualY = baseY;
+            }
+        } else {
+            visualY = i * stride;
+        }
+
+        let itemY = y + visualY;
+        _renderSortableItem(x, itemY, w, itemHeight, items[i], i, false);
+    }
+
+    // Second pass: render dragged item on top
+    if (dragState && dragState.itemIndex < items.length) {
+        let dragIdx = dragState.itemIndex;
+        let itemY = y + dragIdx * stride + dragState.offsetY;
+        _renderSortableItem(x, itemY, w, itemHeight, items[dragIdx], dragIdx, true);
+    }
+});
+
+function _renderSortableItem(x, itemY, w, itemHeight, item, index, isDragged) {
+    // Background
+    let bgAlpha;
+    if (isDragged) {
+        bgAlpha = 0.12;
+    } else if (index % 2 === 0) {
+        bgAlpha = 0.04;
+    } else {
+        bgAlpha = 0.02;
+    }
+    let bg = "rgba(255,255,255," + bgAlpha + ")";
+    draw.roundedRect(x, itemY, w, itemHeight, bg, 6, 0, "", 1);
+
+    // Border for dragged item
+    if (isDragged) {
+        draw.roundedRect(x, itemY, w, itemHeight, "", 6, 1.5, "rgba(99,102,241,0.6)", 1);
+    }
+
+    // Grip handle icon (hamburger ☰)
+    let gripColor = isDragged ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.2)";
+    draw.text("\u2630", x + 8, itemY + (itemHeight - 14) / 2, 14, 400, gripColor,
+        _theme.fontFamily, 20, 1);
+
+    // Primary text
+    let primary = "";
+    let secondary = "";
+    if (typeof item === "string") {
+        primary = item;
+    } else if (item) {
+        primary = item.primary || item.label || item.text || "";
+        secondary = item.secondary || item.subtitle || "";
+    }
+
+    draw.text(primary, x + 32, itemY + 6, 14, 500, "#ffffff",
+        _theme.fontFamily, w - 40, 1);
+
+    if (secondary) {
+        draw.text(secondary, x + 32, itemY + 22, 11, 400, "rgba(161,161,170,1)",
+            _theme.fontFamily, w - 40, 1);
+    }
+}
+
+// ─── Draggable ──────────────────────────────────────────────────────────────
+// A container that can be freely dragged (or constrained to an axis).
+// The drag offset is tracked in state and applied as a transform.
+registerComponent("Draggable", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let axis = p.axis || "free";  // "free", "x", "y"
+    let background = p.background || "";
+    let borderRadius = p.borderRadius || 0;
+    let dragId = p.id || ("drag_" + x + "_" + y);
+
+    // Get drag offset from state
+    let offset = getState("_dragOffset_" + dragId, { x: 0, y: 0 });
+    let dx = 0;
+    let dy = 0;
+    if (axis === "x" || axis === "free") dx = offset.x;
+    if (axis === "y" || axis === "free") dy = offset.y;
+
+    // Apply drag transform
+    if (dx !== 0 || dy !== 0) {
+        draw.pushTransform(dx, dy, 1, 1, 0);
+    }
+
+    if (background) {
+        draw.roundedRect(x, y, w, h, background, borderRadius, 0, "", 1);
+    }
+
+    // Children will be rendered by renderTree inside this transform
+    // We mark that we've pushed a transform so it can be popped
+    if (dx !== 0 || dy !== 0) {
+        node._dragTransformPushed = true;
+    }
+});
+
+// ============================================================================
+// Game Components: Loop, PixelGrid
+// ============================================================================
+
+// ─── Loop ───────────────────────────────────────────────────────────────────
+// Non-visual timer component that fires onTick at a regular interval.
+// No rendering — purely functional.
+registerComponent("Loop", (node, cl) => {
+    let p = node.props;
+    let intervalMs = p.interval || 100;
+    let running = p.running !== undefined ? p.running : true;
+    let onTick = p.onTick;
+
+    if (!running || !onTick) return;
+
+    let loopId = p.id || ("loop_" + cl.x + "_" + cl.y);
+    let stateKey = "_loopState_" + loopId;
+    let state = getState(stateKey, null);
+    let elapsed = input.getElapsedSecs();
+
+    if (!state) {
+        // First frame: initialize
+        setState(stateKey, { lastTick: elapsed });
+        return;
+    }
+
+    let intervalSecs = intervalMs / 1000;
+    if (elapsed - state.lastTick >= intervalSecs) {
+        state.lastTick = elapsed;
+        // Don't use setState to avoid invalidation loop, just update in place
+        onTick();
+        input.requestRedraw();
+    }
+
+    // Keep requesting redraws while running
+    input.requestRedraw();
+});
+
+// ─── PixelGrid ──────────────────────────────────────────────────────────────
+// A rows x cols grid of colored cells for tile-based games (Snake, Tetris, etc.)
+registerComponent("PixelGrid", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+
+    let rows = p.rows || 10;
+    let cols = p.cols || 10;
+    let cellSize = p.cellSize || 20;
+    let items = p.items || [];
+    let overlay = p.overlay || "";
+    let background = p.background || "#1a1a2e";
+
+    let gridW = cols * cellSize;
+    let gridH = rows * cellSize;
+
+    // Background
+    draw.roundedRect(x, y, gridW, gridH, background, 4, 0, "", 1);
+
+    // Grid lines (subtle)
+    let gridColor = "rgba(255,255,255,0.04)";
+    for (let row = 0; row <= rows; row++) {
+        let gy = y + row * cellSize;
+        draw.line(x, gy, x + gridW, gy, gridColor, 0.5, 1);
+    }
+    for (let col = 0; col <= cols; col++) {
+        let gx = x + col * cellSize;
+        draw.line(gx, y, gx, y + gridH, gridColor, 0.5, 1);
+    }
+
+    // Colored cells
+    for (let i = 0; i < items.length; i++) {
+        let item = items[i];
+        if (item.x >= cols || item.y >= rows) continue;
+
+        let cx = x + item.x * cellSize + 0.5;
+        let cy = y + item.y * cellSize + 0.5;
+        let cw = cellSize - 1;
+        let ch = cellSize - 1;
+        let br = item.borderRadius || 0;
+
+        draw.roundedRect(cx, cy, cw, ch, item.color || "#ffffff", br, 0, "", 1);
+    }
+
+    // Overlay (e.g. "Game Over")
+    if (overlay) {
+        // Semi-transparent backdrop
+        draw.roundedRect(x, y, gridW, gridH, "rgba(0,0,0,0.7)", 4, 0, "", 1);
+
+        let fontSize = 20;
+        let measured = draw.measureText(overlay, fontSize, 700, _theme.fontFamily, gridW);
+        let textW = measured ? measured.width : overlay.length * fontSize * 0.52;
+        let textX = x + (gridW - textW) / 2;
+        let textY = y + (gridH - fontSize) / 2;
+        draw.text(overlay, textX, textY, fontSize, 700, "#ffffff",
+            _theme.fontFamily, gridW, 1);
+    }
+});
+
+// ============================================================================
+// Utility Components: Accordion, Collapse, Tooltip
+// ============================================================================
+
+// ─── Accordion ──────────────────────────────────────────────────────────────
+// A list of collapsible items with titles and chevron indicators.
+registerComponent("Accordion", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let items = p.items || [];
+    let activeKeys = p.activeKeys || [];
+    let allowMultiple = p.allowMultiple || false;
+    let background = p.background || "";
+    let borderColor = p.borderColor || "rgba(255,255,255,0.08)";
+    let borderRadius = p.borderRadius || 8;
+
+    // Background
+    if (background) {
+        draw.roundedRect(x, y, w, h, background, borderRadius, 0, "", 1);
+    }
+    // Border
+    if (borderColor) {
+        draw.roundedRect(x, y, w, h, "", borderRadius, 1, borderColor, 1);
+    }
+
+    let itemH = 40;
+    let contentFontSize = 13;
+    let currentY = y;
+
+    for (let i = 0; i < items.length; i++) {
+        let item = items[i];
+        let key = item.key || ("" + i);
+        let title = item.title || "";
+        let content = item.content || "";
+        let isOpen = activeKeys.indexOf(key) >= 0;
+
+        // Title row
+        draw.text(title, x + 12, currentY + (itemH - 14 * 1.2) / 2, 14, 500,
+            "rgba(230,230,230,1)", _theme.fontFamily, w - 36, 1);
+
+        // Chevron arrow
+        let arrowX = x + w - 24;
+        let arrowY = currentY + itemH / 2;
+
+        if (isOpen) {
+            // Chevron up: V shape pointing up
+            let path = "M " + (arrowX - 4) + " " + (arrowY + 2) +
+                " L " + arrowX + " " + (arrowY - 2) +
+                " L " + (arrowX + 4) + " " + (arrowY + 2);
+            draw.path(path, "", "rgba(180,180,180,1)", 1.5, 1);
+        } else {
+            // Chevron down: V shape pointing down
+            let path = "M " + (arrowX - 4) + " " + (arrowY - 2) +
+                " L " + arrowX + " " + (arrowY + 2) +
+                " L " + (arrowX + 4) + " " + (arrowY - 2);
+            draw.path(path, "", "rgba(180,180,180,1)", 1.5, 1);
+        }
+
+        currentY = currentY + itemH;
+
+        // Content (if open)
+        if (isOpen && content) {
+            let measured = draw.measureText(content, contentFontSize, 400, _theme.fontFamily, w - 24);
+            let contentH = measured ? measured.height + 16 : 40;
+
+            draw.text(content, x + 12, currentY + 8, contentFontSize, 400,
+                "rgba(161,161,170,1)", _theme.fontFamily, w - 24, 1);
+
+            currentY = currentY + contentH;
+        }
+
+        // Divider between items
+        if (i < items.length - 1) {
+            draw.line(x + 1, currentY, x + w - 1, currentY, borderColor, 1, 1);
+        }
+    }
+});
+
+// ─── Collapse ───────────────────────────────────────────────────────────────
+// Layout-only wrapper that shows/hides children based on the `open` prop.
+// No visual rendering — purely controls whether children are included.
+registerComponent("Collapse", (node, cl) => {
+    let p = node.props;
+    let open = p.open !== undefined ? p.open : true;
+
+    if (!open) {
+        // Hide children by preventing them from rendering
+        node._childrenRendered = true;
+    }
+    // If open, children render normally via renderTree
+});
+
+// ─── Tooltip ────────────────────────────────────────────────────────────────
+// Renders a small popup near the hovered element.
+registerComponent("Tooltip", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let content = p.content || "";
+    let position = p.position || "top";  // top, bottom, left, right
+    let tooltipBg = p.background || _theme.tooltipBg;
+    let tooltipColor = p.color || _theme.tooltipColor;
+
+    if (!content) return;
+
+    // Only show tooltip on hover
+    let mx = input.getMouseX();
+    let my = input.getMouseY();
+    let hovered = mx >= x && mx < x + w && my >= y && my < y + h;
+
+    if (!hovered) return;
+
+    let fontSize = 12;
+    let paddingX = 8;
+    let paddingY = 4;
+
+    let measured = draw.measureText(content, fontSize, 400, _theme.fontFamily, 300);
+    let tipW = measured ? measured.width + paddingX * 2 : content.length * fontSize * 0.6 + paddingX * 2;
+    let tipH = measured ? measured.height + paddingY * 2 : fontSize * 1.4 + paddingY * 2;
+
+    let tipX;
+    let tipY;
+    let tooltipGap = 6;
+
+    if (position === "top") {
+        tipX = x + (w - tipW) / 2;
+        tipY = y - tipH - tooltipGap;
+    } else if (position === "bottom") {
+        tipX = x + (w - tipW) / 2;
+        tipY = y + h + tooltipGap;
+    } else if (position === "left") {
+        tipX = x - tipW - tooltipGap;
+        tipY = y + (h - tipH) / 2;
+    } else if (position === "right") {
+        tipX = x + w + tooltipGap;
+        tipY = y + (h - tipH) / 2;
+    } else {
+        tipX = x + (w - tipW) / 2;
+        tipY = y - tipH - tooltipGap;
+    }
+
+    // Tooltip background
+    draw.roundedRect(tipX, tipY, tipW, tipH, tooltipBg, 6, 0, "", 1);
+
+    // Tooltip text
+    draw.text(content, tipX + paddingX, tipY + paddingY, fontSize, 400,
+        tooltipColor, _theme.fontFamily, tipW - paddingX * 2, 1);
+});
+
+// ============================================================================
+// 3D Component: Scene3D
+// ============================================================================
+
+// ─── Scene3D ────────────────────────────────────────────────────────────────
+// Wraps the scene3d bridge to render a 3D scene within a 2D layout region.
+// Objects, lights, and camera are configured via props. The bridge handles
+// all GPU rendering and composites the result into the vello scene.
+registerComponent("Scene3D", (node, cl) => {
+    let p = node.props;
+    let x = cl.x;
+    let y = cl.y;
+    let w = cl.width;
+    let h = cl.height;
+
+    let sceneId = p.id || ("scene3d_" + x + "_" + y);
+    let background = p.background || [0.102, 0.102, 0.180, 1.0];
+    let objects = p.objects || [];
+    let lights = p.lights || [];
+    let camera = p.camera || {};
+    let orbitControls = p.orbitControls || false;
+    let autoRotate = p.autoRotate || false;
+    let autoRotateSpeed = p.autoRotateSpeed || 2.0;
+    let onClick = p.onClick;
+
+    // State key for scene lifecycle
+    let stateKey = "_scene3d_" + sceneId;
+    let sceneHandle = getState(stateKey, null);
+
+    // Create scene if not already created
+    if (!sceneHandle) {
+        sceneHandle = scene3d.createScene();
+        setState(stateKey, sceneHandle);
+    }
+
+    // Clear and rebuild scene each frame
+    scene3d.clearScene(sceneHandle);
+
+    // Add objects — use positional args matching the VM dispatch:
+    // addObject(scene, geometry, position, rotation, scale, color, id, wireframe, opacity, geometryArgs)
+    for (let i = 0; i < objects.length; i++) {
+        let obj = objects[i];
+        let geom = obj.geometry || "box";
+        let pos = obj.position || [0, 0, 0];
+        let rot = obj.rotation || [0, 0, 0];
+        let scl = obj.scale || [1, 1, 1];
+        let col = obj.color || "#888888";
+        let oid = obj.id || ("obj_" + i);
+        let wire = obj.wireframe || false;
+        let opa = obj.opacity !== undefined ? obj.opacity : 1.0;
+        // Geometry args: [width, height, depth, radius, tube_radius, inner_radius, segments]
+        let gargs = [];
+        if (obj.width !== undefined) gargs.push(obj.width); else gargs.push(1.0);
+        if (obj.height !== undefined) gargs.push(obj.height); else gargs.push(1.0);
+        if (obj.depth !== undefined) gargs.push(obj.depth); else gargs.push(1.0);
+        if (obj.radius !== undefined) gargs.push(obj.radius); else gargs.push(0.5);
+        if (obj.tubeRadius !== undefined) gargs.push(obj.tubeRadius); else gargs.push(0.4);
+        if (obj.innerRadius !== undefined) gargs.push(obj.innerRadius); else gargs.push(0.5);
+        if (obj.segments !== undefined) gargs.push(obj.segments); else gargs.push(32);
+
+        scene3d.addObject(sceneHandle, geom, pos, rot, scl, col, oid, wire, opa, gargs);
+    }
+
+    // Add lights — positional args: addLight(scene, kind, position, color, intensity)
+    for (let i = 0; i < lights.length; i++) {
+        let light = lights[i];
+        let kind = light.kind || light.type || "directional";
+        let lpos = light.position || [0, 5, 5];
+        let lcol = light.color || "#ffffff";
+        let lint = light.intensity !== undefined ? light.intensity : 1.0;
+        scene3d.addLight(sceneHandle, kind, lpos, lcol, lint);
+    }
+
+    // Set camera
+    let camPosition = camera.position || [0, 5, 10];
+    let camTarget = camera.target || camera.lookAt || [0, 0, 0];
+    let camFov = camera.fov || 45;
+    scene3d.setCamera(sceneHandle, camPosition, camTarget, camFov);
+
+    // Orbit controls — only boolean for now
+    if (orbitControls) {
+        scene3d.setOrbitControls(sceneHandle, true);
+    }
+
+    // Animations — positional args: setAnimation(scene, objectHandle, property, speed)
+    // Note: objects are added in order, handles start at 1 and increment
+    for (let i = 0; i < objects.length; i++) {
+        let obj = objects[i];
+        if (obj.animate) {
+            let anim = obj.animate;
+            let objHandle = i + 1; // handles start at 1 in ManagedScene
+
+            // animate can be a string like "rotateY" or an object {property, speed}
+            if (typeof anim === "string") {
+                scene3d.setAnimation(sceneHandle, objHandle, anim, 1.0);
+            } else if (typeof anim === "object") {
+                let prop = anim.property || anim.type || "rotateY";
+                let spd = anim.speed !== undefined ? anim.speed : 1.0;
+                scene3d.setAnimation(sceneHandle, objHandle, prop, spd);
+            }
+        }
+    }
+
+    // Render — positional args: renderScene(scene, x, y, w, h, elapsed, background)
+    let elapsed = input.getElapsedSecs();
+    scene3d.renderScene(sceneHandle, x, y, w, h, elapsed, background);
+
+    // Handle click (raycast)
+    if (onClick && input.isMousePressed()) {
+        let mx = input.getMouseX();
+        let my = input.getMouseY();
+        if (mx >= x && mx < x + w && my >= y && my < y + h) {
+            let hit = scene3d.raycast(sceneHandle, mx - x, my - y, w, h);
+            if (hit) {
+                onClick(hit);
+            }
+        }
+    }
+
+    // Request continuous redraw if orbit or auto-rotate is active
+    if (orbitControls || autoRotate) {
+        input.requestRedraw();
+    }
+});
+
+
+
+// ============================================================================
+// Event dispatch helper
+// ============================================================================
+
+function _dispatchEvents() {
+    if (!_rootNode) return;
+
+    let mx = input.getMouseX();
+    let my = input.getMouseY();
+
+    // Mouse click
+    if (input.isMousePressed()) {
+        let hit = hitTest(_rootNode, mx, my);
+        if (hit && hit.props && hit.props.onClick) {
+            hit.props.onClick();
+        }
+    }
+
+    // Hover cursor
+    let hover = hitTest(_rootNode, mx, my);
+    if (hover && hover.props && (hover.props.onClick || hover.props.cursor)) {
+        input.setCursor(hover.props.cursor || "pointer");
+    } else {
+        input.setCursor("default");
+    }
+}
+
+
+let count = 0;
+
+function increment() {
+    count = count + 1;
+    invalidate();
+}
+
+function decrement() {
+    count = count - 1;
+    invalidate();
+}
+
+function reset() {
+    count = 0;
+    invalidate();
+}
+
+function buildApp() {
+    return createNode("Center", {}, {width: "100%", height: "100%"}, [
+        createNode("Card", {}, {width: 400, padding: 32, gap: 24}, [
+            // Title
+            createNode("Heading", {
+                text: "Counter",
+                level: 2
+            }, {}, []),
+
+            // Count display
+            createNode("Center", {}, {}, [
+                createNode("Text", {
+                    text: "" + count,
+                    fontSize: 72,
+                    fontWeight: 700,
+                    color: count >= 0 ? "#6366f1" : "#ef4444"
+                }, {}, [])
+            ]),
+
+            // Buttons row
+            createNode("Stack", {direction: "horizontal"}, {
+                justifyContent: "center",
+                gap: 12
+            }, [
+                createNode("Button", {
+                    text: "- Decrease",
+                    variant: "outline",
+                    onClick: () => { decrement(); }
+                }, {}, []),
+
+                createNode("Button", {
+                    text: "Reset",
+                    variant: "ghost",
+                    onClick: () => { reset(); }
+                }, {}, []),
+
+                createNode("Button", {
+                    text: "+ Increase",
+                    variant: "solid",
+                    onClick: () => { increment(); }
+                }, {}, [])
+            ])
+        ])
+    ]);
+}
+
+// Use setBuilderFn for automatic reactivity — the runtime calls buildApp()
+// every frame, so event handlers only need to mutate state + invalidate().
+setBuilderFn(buildApp);

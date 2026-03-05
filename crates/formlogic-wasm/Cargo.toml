@@ -1,0 +1,18 @@
+[package]
+name = "formlogic-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+formlogic-core = { path = "../formlogic-core" }
+js-sys = "0.3"
+serde_json = "1"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console"] }
+console_error_panic_hook = "0.1"
