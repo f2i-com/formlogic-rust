@@ -286,6 +286,8 @@ pub enum Object {
     SuperRef(Box<SuperRefObject>),
     Promise(Box<PromiseObject>),
     Generator(Rc<VmCell<GeneratorObject>>),
+    /// A unique symbol value with an optional description and a unique ID.
+    Symbol(u32, Option<Rc<str>>),
     ReturnValue(Box<Object>),
     Error(Box<ErrorObject>),
 }
@@ -438,6 +440,7 @@ pub enum BuiltinFunction {
     SetValues,
     SetEntries,
     SetForEach,
+    SymbolCtor,
     GeneratorNext,
     GeneratorReturn,
     GeneratorThrow,
@@ -1059,6 +1062,7 @@ impl Object {
             Object::SuperRef(_) => ObjectType::SuperRef,
             Object::Promise(_) => ObjectType::Promise,
             Object::Generator(_) => ObjectType::Generator,
+            Object::Symbol(_, _) => ObjectType::Symbol,
             Object::ReturnValue(_) => ObjectType::ReturnValue,
             Object::Error(_) => ObjectType::Error,
         }
@@ -1113,6 +1117,10 @@ impl Object {
                 PromiseState::Rejected(v) => format!("[Promise rejected {}]", v.inspect()),
             },
             Object::Generator(_) => "[Generator]".to_string(),
+            Object::Symbol(id, desc) => match desc {
+                Some(d) => format!("Symbol({})", d),
+                None => format!("Symbol({})", id),
+            },
             Object::ReturnValue(v) => v.inspect(),
             Object::Error(err) => format!("{}: {}", err.name, err.message),
         }

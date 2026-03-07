@@ -1612,6 +1612,26 @@ impl RCompiler {
         body: &[Statement],
         label: Option<&str>,
     ) -> Result<(), String> {
+        // Detect let-declared loop variables captured by inner function literals.
+        // These need per-iteration snapshotting via MakeClosure.
+        let mut loop_capture_slots: Vec<u16> = vec![];
+        if let Some(Statement::Let {
+            name,
+            kind: crate::ast::VariableKind::Let,
+            ..
+        }) = init
+        {
+            let body_captures = scan_captured_names(body);
+            if body_captures.contains(name) {
+                // Ensure the loop variable has a global slot
+                let g = self.ensure_global_slot(name)?;
+                if !self.param_shadow_slots.contains(&g) {
+                    self.param_shadow_slots.insert(g);
+                    loop_capture_slots.push(g);
+                }
+            }
+        }
+
         if let Some(init_stmt) = init {
             self.compile_statement(init_stmt)?;
         }
@@ -1687,6 +1707,13 @@ impl RCompiler {
                 self.patch_jump(pos, ctx.continue_target);
             }
         }
+
+        // Clean up: remove loop-variable capture slots so they don't affect
+        // function literals outside this for-loop.
+        for slot in &loop_capture_slots {
+            self.param_shadow_slots.remove(slot);
+        }
+
         Ok(())
     }
 

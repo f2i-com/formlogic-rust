@@ -239,6 +239,7 @@ pub struct VM {
     pub(crate) typeof_boolean: Value,
     pub(crate) typeof_function: Value,
     pub(crate) typeof_object: Value,
+    pub(crate) typeof_symbol: Value,
     /// Cached method symbol IDs for fast-path dispatch (lazily initialized).
     /// u32::MAX = uninitialized. Symbol IDs are stable across VM lifetime.
     pub(crate) sym_push: u32,
@@ -252,6 +253,8 @@ pub struct VM {
     pub(crate) sym_unshift: u32,
     pub(crate) sym_splice: u32,
     pub(crate) sym_has_own_property: u32,
+    pub(crate) sym_then: u32,
+    pub(crate) sym_catch: u32,
     /// Fast path for `preconvert_constants`: remembers the last-used constants_raw
     /// key and its resolved pointers. Skips the linear cache scan when the same
     /// function is called repeatedly (e.g. `add()` called 1000× from a loop).
@@ -374,6 +377,7 @@ impl VM {
             typeof_boolean: Value::UNDEFINED,
             typeof_function: Value::UNDEFINED,
             typeof_object: Value::UNDEFINED,
+            typeof_symbol: Value::UNDEFINED,
             sym_push: crate::intern::intern("push"),
             sym_pop: crate::intern::intern("pop"),
             sym_length: crate::intern::intern("length"),
@@ -385,6 +389,8 @@ impl VM {
             sym_unshift: crate::intern::intern("unshift"),
             sym_splice: crate::intern::intern("splice"),
             sym_has_own_property: crate::intern::intern("hasOwnProperty"),
+            sym_then: crate::intern::intern("then"),
+            sym_catch: crate::intern::intern("catch"),
             last_preconvert_key: 0,
             last_preconvert_values_ptr: std::ptr::null(),
             last_preconvert_syms_ptr: std::ptr::null(),
@@ -471,6 +477,7 @@ impl VM {
             typeof_boolean: Value::UNDEFINED,
             typeof_function: Value::UNDEFINED,
             typeof_object: Value::UNDEFINED,
+            typeof_symbol: Value::UNDEFINED,
             sym_push: crate::intern::intern("push"),
             sym_pop: crate::intern::intern("pop"),
             sym_length: crate::intern::intern("length"),
@@ -482,6 +489,8 @@ impl VM {
             sym_unshift: crate::intern::intern("unshift"),
             sym_splice: crate::intern::intern("splice"),
             sym_has_own_property: crate::intern::intern("hasOwnProperty"),
+            sym_then: crate::intern::intern("then"),
+            sym_catch: crate::intern::intern("catch"),
             last_preconvert_key: 0,
             last_preconvert_values_ptr: std::ptr::null(),
             last_preconvert_syms_ptr: std::ptr::null(),
@@ -3720,6 +3729,7 @@ impl VM {
             let obj = self.heap.get(val.heap_index());
             match obj {
                 Object::String(s) => HashKey::Sym(crate::intern::intern_rc(s)),
+                Object::Symbol(id, _) => HashKey::Other(format!("@@sym:{}", id)),
                 other => HashKey::Other(other.inspect()),
             }
         } else {
@@ -5062,6 +5072,13 @@ impl VM {
                     let func = (**f).clone();
                     let (result, _) = self.execute_compiled_function_slice(func, args, None)?;
                     return Ok(result);
+                }
+                // Hash with __call__: invoke the __call__ builtin (e.g. Symbol())
+                Object::Hash(hash_rc) => {
+                    let call_sym = crate::intern::intern("__call__");
+                    if let Some(call_val) = hash_rc.borrow().get_by_sym(call_sym) {
+                        return self.call_value_slice(call_val, args);
+                    }
                 }
                 _ => {}
             }
@@ -6773,6 +6790,21 @@ impl VM {
                 let parsed = self.json_parse(&source)?;
                 Ok(obj_into_val(parsed, &mut self.heap))
             }
+            BuiltinFunction::SymbolCtor => {
+                static NEXT_SYMBOL_ID: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(100); // IDs < 100 reserved for well-known symbols
+                let id = NEXT_SYMBOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let desc = args.first().and_then(|v| {
+                    if v.is_undefined() {
+                        None
+                    } else {
+                        let obj = val_to_obj(*v, &self.heap);
+                        Some(Rc::from(obj.to_js_string().as_str()))
+                    }
+                });
+                let sym = Object::Symbol(id, desc);
+                Ok(obj_into_val(sym, &mut self.heap))
+            }
             BuiltinFunction::PromiseResolve => {
                 let value = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let value_obj = val_to_obj(value, &self.heap);
@@ -7474,25 +7506,75 @@ impl VM {
                         .map(|c| Object::String(c.to_string().into()))
                         .collect(),
                     Object::Hash(hash) => {
-                        let hash_b = hash.borrow_mut();
-                        hash_b.sync_pairs_if_dirty();
-                        if let Some(length_val) = hash_b.get_by_str("length") {
-                            let length_obj = val_to_obj(length_val, &self.heap);
-                            let len = self.to_u32(&length_obj).unwrap_or(0) as usize;
-                            let mut arr = Vec::with_capacity(len);
-                            for i in 0..len {
-                                let key = HashKey::from_string(&i.to_string());
-                                arr.push(
-                                    hash_b
-                                        .pairs
-                                        .get(&key)
-                                        .map(|v| val_to_obj(*v, &self.heap))
-                                        .unwrap_or_else(undefined_object),
-                                );
+                        // Check for Symbol.iterator protocol (@@sym:1)
+                        let iter_fn_opt = {
+                            let hash_b = hash.borrow_mut();
+                            hash_b.sync_pairs_if_dirty();
+                            let sym_iter_key = HashKey::Other("@@sym:1".to_string());
+                            hash_b.pairs.get(&sym_iter_key).copied()
+                        };
+                        if let Some(iter_fn_val) = iter_fn_opt {
+                            // Call [Symbol.iterator]() to get the iterator object
+                            let iterator_val =
+                                self.call_value_slice(iter_fn_val, &[source_val])?;
+                            // Iterate: call .next() until done
+                            let mut items = Vec::new();
+                            loop {
+                                let next_sym = crate::intern::intern("next");
+                                let next_fn =
+                                    self.get_property_val(iterator_val, next_sym, 0)?;
+                                let result =
+                                    self.call_value_slice(next_fn, &[iterator_val])?;
+                                let result_obj = val_to_obj(result, &self.heap);
+                                match result_obj {
+                                    Object::Hash(h) => {
+                                        let hb = h.borrow();
+                                        let done = hb
+                                            .get_by_str("done")
+                                            .map(|v| {
+                                                let obj = val_to_obj(v, &self.heap);
+                                                self.is_truthy(&obj)
+                                            })
+                                            .unwrap_or(false);
+                                        if done {
+                                            break;
+                                        }
+                                        let value = hb
+                                            .get_by_str("value")
+                                            .map(|v| val_to_obj(v, &self.heap))
+                                            .unwrap_or_else(undefined_object);
+                                        items.push(value);
+                                    }
+                                    _ => break,
+                                }
+                                if items.len() > MAX_ARRAY_SIZE {
+                                    return Err(VMError::TypeError(
+                                        "Array.from: iterator too large"
+                                            .to_string(),
+                                    ));
+                                }
                             }
-                            arr
+                            items
                         } else {
-                            vec![]
+                            let hash_b = hash.borrow_mut();
+                            if let Some(length_val) = hash_b.get_by_str("length") {
+                                let length_obj = val_to_obj(length_val, &self.heap);
+                                let len = self.to_u32(&length_obj).unwrap_or(0) as usize;
+                                let mut arr = Vec::with_capacity(len);
+                                for i in 0..len {
+                                    let key = HashKey::from_string(&i.to_string());
+                                    arr.push(
+                                        hash_b
+                                            .pairs
+                                            .get(&key)
+                                            .map(|v| val_to_obj(*v, &self.heap))
+                                            .unwrap_or_else(undefined_object),
+                                    );
+                                }
+                                arr
+                            } else {
+                                vec![]
+                            }
                         }
                     }
                     Object::Set(set_obj) => set_obj

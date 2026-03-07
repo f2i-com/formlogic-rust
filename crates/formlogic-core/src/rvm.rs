@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::object::{make_array, make_hash, Object, PromiseState, SuperRefObject};
+use crate::object::{make_array, make_hash, Object, PromiseObject, PromiseState, SuperRefObject};
 use crate::rcode::ROp;
 use crate::value::{obj_into_val, val_as_obj_ref, val_inspect, val_to_obj, Value};
 use crate::vm::{VMError, MAX_ARRAY_SIZE, STACK_SIZE, VM};
@@ -593,6 +593,8 @@ impl VM {
                             obj_into_val(Object::String(Rc::from("function")), &mut self.heap);
                         self.typeof_object =
                             obj_into_val(Object::String(Rc::from("object")), &mut self.heap);
+                        self.typeof_symbol =
+                            obj_into_val(Object::String(Rc::from("symbol")), &mut self.heap);
                     }
                     let result = if value.is_undefined() {
                         self.typeof_undefined
@@ -613,6 +615,7 @@ impl VM {
                             Object::CompiledFunction(_) | Object::BoundMethod(_) => {
                                 self.typeof_function
                             }
+                            Object::Symbol(_, _) => self.typeof_symbol,
                             _ => self.typeof_object,
                         }
                     } else {
@@ -2886,6 +2889,50 @@ impl VM {
                 };
                 let has = h.borrow().contains_str(&key_str);
                 return Ok(Value::from_bool(has));
+            }
+        }
+
+        // Promise.then() / .catch() — synchronous settlement
+        if obj_val.is_heap() {
+            let heap_obj = self.heap.get(obj_val.heap_index());
+            if let Object::Promise(p) = heap_obj {
+                if prop_sym == self.sym_then && nargs >= 1 {
+                    let callback = unsafe { *self.stack.get_unchecked(arg_start) };
+                    match &p.settled {
+                        PromiseState::Fulfilled(v) => {
+                            let arg = obj_into_val(v.as_ref().clone(), &mut self.heap);
+                            let result = self.call_value_slice(callback, &[arg])?;
+                            let promise = Object::Promise(Box::new(PromiseObject {
+                                settled: PromiseState::Fulfilled(Box::new(val_to_obj(
+                                    result, &self.heap,
+                                ))),
+                            }));
+                            return Ok(obj_into_val(promise, &mut self.heap));
+                        }
+                        PromiseState::Rejected(_) => {
+                            // .then() on rejected: skip callback, return same rejected promise
+                            return Ok(obj_val);
+                        }
+                    }
+                } else if prop_sym == self.sym_catch && nargs >= 1 {
+                    let callback = unsafe { *self.stack.get_unchecked(arg_start) };
+                    match &p.settled {
+                        PromiseState::Rejected(v) => {
+                            let arg = obj_into_val(v.as_ref().clone(), &mut self.heap);
+                            let result = self.call_value_slice(callback, &[arg])?;
+                            let promise = Object::Promise(Box::new(PromiseObject {
+                                settled: PromiseState::Fulfilled(Box::new(val_to_obj(
+                                    result, &self.heap,
+                                ))),
+                            }));
+                            return Ok(obj_into_val(promise, &mut self.heap));
+                        }
+                        PromiseState::Fulfilled(_) => {
+                            // .catch() on fulfilled: skip callback, return same fulfilled promise
+                            return Ok(obj_val);
+                        }
+                    }
+                }
             }
         }
 

@@ -2128,7 +2128,6 @@ fn class_instance_repeated_method_calls() {
 }
 
 #[test]
-#[ignore] // Known limitation: per-iteration let bindings require cell/closure mechanism
 fn for_loop_closure_captures_per_iteration() {
     let engine = FormLogicEngine::default();
     let out = engine
@@ -6152,7 +6151,6 @@ fn bitwise_right_shift() {
 // ── Promise (basic) ─────────────────────────────────────────────────
 
 #[test]
-#[ignore = "Promise.resolve().then synchronous callback not yet working"]
 fn promise_resolve_then() {
     assert_eval_int(
         r#"
@@ -11238,7 +11236,6 @@ fn generator_for_of_iteration() {
 }
 
 #[test]
-#[ignore] // Symbol.iterator protocol for custom iterables not supported
 fn custom_iterable_for_of() {
     assert_eval_int(
         r#"
@@ -11271,7 +11268,6 @@ fn structured_clone_basic() {
 }
 
 #[test]
-#[ignore] // Symbol not implemented
 fn symbol_basic_type() {
     assert_eval_str(r#" let s = Symbol("foo"); typeof s "#, "symbol");
 }

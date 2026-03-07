@@ -3412,6 +3412,26 @@ impl Compiler {
                 Some(make_hash(hash))
             }
 
+            "Symbol" => {
+                // Symbol is both callable (creates unique symbols) and has well-known
+                // symbol properties (e.g. Symbol.iterator). We represent it as a Hash
+                // with a __call__ entry plus static symbol properties.
+                let mut hash = HashObject::default();
+                hash.insert_pair_obj(
+                    Self::hash_key_string("__call__"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::SymbolCtor,
+                        receiver: None,
+                    })),
+                );
+                // Well-known symbol: Symbol.iterator (id=1)
+                hash.insert_pair_obj(
+                    Self::hash_key_string("iterator"),
+                    Object::Symbol(1, Some(Rc::from("Symbol.iterator"))),
+                );
+                Some(make_hash(hash))
+            }
+
             _ => None,
         }
     }
