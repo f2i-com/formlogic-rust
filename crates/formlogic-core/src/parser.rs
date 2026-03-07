@@ -128,6 +128,36 @@ impl<'a> Parser<'a> {
             TokenType::Async => self.parse_async_statement(),
             TokenType::Break => self.parse_break_statement(),
             TokenType::Continue => self.parse_continue_statement(),
+            TokenType::LeftBrace => {
+                // Disambiguate block vs object literal at statement level.
+                // Treat as block if next token is a statement keyword or `}` (empty block).
+                let is_block = matches!(
+                    self.peek_token.token_type,
+                    TokenType::Let
+                        | TokenType::Const
+                        | TokenType::Var
+                        | TokenType::For
+                        | TokenType::While
+                        | TokenType::Do
+                        | TokenType::If
+                        | TokenType::Return
+                        | TokenType::Function
+                        | TokenType::Class
+                        | TokenType::Try
+                        | TokenType::Throw
+                        | TokenType::Switch
+                        | TokenType::Break
+                        | TokenType::Continue
+                        | TokenType::RightBrace
+                        | TokenType::LeftBrace
+                );
+                if is_block {
+                    let stmts = self.parse_block_statement();
+                    Some(Statement::Block(stmts))
+                } else {
+                    self.parse_expression_statement()
+                }
+            }
             _ => self.parse_expression_statement(),
         }
     }
@@ -217,20 +247,27 @@ impl<'a> Parser<'a> {
 
         if self.peek_token.token_type == TokenType::Catch {
             self.next_token(); // catch
-            if !self.expect_peek(TokenType::LeftParen) {
-                return None;
+            // Optional catch binding: `catch { ... }` (no parameter)
+            if self.peek_token.token_type == TokenType::LeftBrace {
+                // No parameter — catch_param stays None
+                self.next_token(); // consume `{`
+                catch_block = Some(self.parse_block_statement());
+            } else {
+                if !self.expect_peek(TokenType::LeftParen) {
+                    return None;
+                }
+                if !self.expect_peek(TokenType::Ident) {
+                    return None;
+                }
+                catch_param = Some(self.cur_token.literal.clone());
+                if !self.expect_peek(TokenType::RightParen) {
+                    return None;
+                }
+                if !self.expect_peek(TokenType::LeftBrace) {
+                    return None;
+                }
+                catch_block = Some(self.parse_block_statement());
             }
-            if !self.expect_peek(TokenType::Ident) {
-                return None;
-            }
-            catch_param = Some(self.cur_token.literal.clone());
-            if !self.expect_peek(TokenType::RightParen) {
-                return None;
-            }
-            if !self.expect_peek(TokenType::LeftBrace) {
-                return None;
-            }
-            catch_block = Some(self.parse_block_statement());
         }
 
         if self.peek_token.token_type == TokenType::Finally {
@@ -471,16 +508,50 @@ impl<'a> Parser<'a> {
                     return None;
                 }
             };
-            if !self.expect_peek(TokenType::Assign) {
-                return None;
-            }
-            self.next_token();
-            let init_value = self.parse_expression(Precedence::Lowest)?;
-            let init = Some(Box::new(Statement::Let {
+            let first_value = if self.peek_token.token_type == TokenType::Assign {
+                self.next_token(); // consume =
+                self.next_token(); // start of value expr
+                self.parse_expression(Precedence::Lowest)?
+            } else {
+                Expression::Identifier("undefined".to_string())
+            };
+            let mut decls: Vec<Statement> = vec![Statement::Let {
                 name: var_name,
-                value: init_value,
-                kind,
-            }));
+                value: first_value,
+                kind: kind.clone(),
+            }];
+
+            // Handle comma-separated declarations: `let i = 0, j = 10`
+            while self.peek_token.token_type == TokenType::Comma {
+                self.next_token(); // consume comma
+                if self.peek_token.token_type != TokenType::Ident {
+                    self.errors.push(format!(
+                        "expected identifier after ',' in for-loop initializer, got {:?}",
+                        self.peek_token.token_type
+                    ));
+                    return None;
+                }
+                self.next_token(); // consume ident
+                let next_name = self.cur_token.literal.clone();
+                let next_value = if self.peek_token.token_type == TokenType::Assign {
+                    self.next_token(); // consume =
+                    self.next_token(); // start of value expr
+                    self.parse_expression(Precedence::Lowest)?
+                } else {
+                    Expression::Identifier("undefined".to_string())
+                };
+                decls.push(Statement::Let {
+                    name: next_name,
+                    value: next_value,
+                    kind: kind.clone(),
+                });
+            }
+
+            let init = if decls.len() == 1 {
+                Some(Box::new(decls.remove(0)))
+            } else {
+                Some(Box::new(Statement::MultiLet(decls)))
+            };
 
             if self.peek_token.token_type == TokenType::Semicolon {
                 self.next_token();
@@ -509,7 +580,7 @@ impl<'a> Parser<'a> {
             let update = if self.cur_token.token_type == TokenType::RightParen {
                 None
             } else {
-                let upd = self.parse_expression(Precedence::Lowest)?;
+                let upd = self.parse_sequence_expression()?;
                 if !self.expect_peek(TokenType::RightParen) {
                     return None;
                 }
@@ -570,7 +641,7 @@ impl<'a> Parser<'a> {
         let update = if self.cur_token.token_type == TokenType::RightParen {
             None
         } else {
-            let upd = self.parse_expression(Precedence::Lowest)?;
+            let upd = self.parse_sequence_expression()?;
             if !self.expect_peek(TokenType::RightParen) {
                 return None;
             }
@@ -929,7 +1000,7 @@ impl<'a> Parser<'a> {
                 if self.peek_token.token_type == TokenType::Semicolon {
                     self.next_token();
                 }
-                return Some(Statement::Block(stmts));
+                return Some(Statement::MultiLet(stmts));
             }
         }
 
@@ -938,6 +1009,49 @@ impl<'a> Parser<'a> {
         }
         self.next_token();
         let value = self.parse_expression(Precedence::Lowest)?;
+
+        // Multi-declaration with initializers: let a = 1, b = 2;
+        if self.peek_token.token_type == TokenType::Comma && pattern_or_name.1.is_some() {
+            let first_stmt = Statement::Let {
+                name: pattern_or_name.1.expect("name exists"),
+                value,
+                kind: kind.clone(),
+            };
+            let mut stmts = vec![first_stmt];
+            while self.peek_token.token_type == TokenType::Comma {
+                self.next_token(); // consume comma
+                if self.peek_token.token_type != TokenType::Ident {
+                    self.errors.push(format!(
+                        "expected identifier after comma in declaration, got {:?}",
+                        self.peek_token.token_type
+                    ));
+                    return None;
+                }
+                self.next_token(); // consume ident
+                let var_name = self.cur_token.literal.clone();
+                if self.peek_token.token_type == TokenType::Assign {
+                    self.next_token(); // consume =
+                    self.next_token(); // start of value expr
+                    let val = self.parse_expression(Precedence::Lowest)?;
+                    stmts.push(Statement::Let {
+                        name: var_name,
+                        value: val,
+                        kind: kind.clone(),
+                    });
+                } else {
+                    stmts.push(Statement::Let {
+                        name: var_name,
+                        value: Expression::Identifier("undefined".to_string()),
+                        kind: kind.clone(),
+                    });
+                }
+            }
+            if self.peek_token.token_type == TokenType::Semicolon {
+                self.next_token();
+            }
+            return Some(Statement::MultiLet(stmts));
+        }
+
         if self.peek_token.token_type == TokenType::Semicolon {
             self.next_token();
         }
@@ -1562,7 +1676,7 @@ impl<'a> Parser<'a> {
         let body = if self.cur_token.token_type == TokenType::LeftBrace {
             self.parse_block_statement()
         } else {
-            let expr = self.parse_expression(Precedence::Assign)?;
+            let expr = self.parse_expression(Precedence::Lowest)?;
             vec![Statement::Expression(expr)]
         };
 
@@ -1571,6 +1685,7 @@ impl<'a> Parser<'a> {
             body,
             is_async,
             is_generator: false,
+            is_arrow: true,
         })
     }
 
@@ -1608,7 +1723,7 @@ impl<'a> Parser<'a> {
         let raw_body = if self.cur_token.token_type == TokenType::LeftBrace {
             self.parse_block_statement()
         } else {
-            let expr = self.parse_expression(Precedence::Assign)?;
+            let expr = self.parse_expression(Precedence::Lowest)?;
             vec![Statement::Expression(expr)]
         };
 
@@ -1619,6 +1734,7 @@ impl<'a> Parser<'a> {
             body,
             is_async,
             is_generator: false,
+            is_arrow: true,
         })
     }
 
@@ -1648,7 +1764,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.next_token();
-        let right = self.parse_expression(Precedence::Assign)?;
+        // Use Lowest so that assignment is right-associative:
+        // `a = b = c = 5` parses as `a = (b = (c = 5))`
+        let right = self.parse_expression(Precedence::Lowest)?;
         Some(Expression::Assign {
             left: Box::new(left),
             operator: op,
@@ -1764,6 +1882,7 @@ impl<'a> Parser<'a> {
             body,
             is_async,
             is_generator,
+            is_arrow: false,
         })
     }
 
@@ -2292,6 +2411,11 @@ impl<'a> Parser<'a> {
         list.push(self.parse_expression_list_item()?);
         while self.peek_token.token_type == TokenType::Comma {
             self.next_token();
+            // Trailing comma: if next token is the closing delimiter, stop
+            if self.peek_token.token_type == end {
+                self.next_token();
+                return Some(list);
+            }
             self.next_token();
             list.push(self.parse_expression_list_item()?);
         }
@@ -2666,6 +2790,22 @@ impl<'a> Parser<'a> {
             Statement::Expression(expr) => Ok(expr.clone()),
             _ => Err("template interpolation must contain an expression".to_string()),
         }
+    }
+
+    /// Parse a potentially comma-separated sequence of expressions.
+    /// Returns a single expression if no commas, or `Expression::Sequence` for `a, b, c`.
+    fn parse_sequence_expression(&mut self) -> Option<Expression> {
+        let first = self.parse_expression(Precedence::Lowest)?;
+        if self.peek_token.token_type != TokenType::Comma {
+            return Some(first);
+        }
+        let mut exprs = vec![first];
+        while self.peek_token.token_type == TokenType::Comma {
+            self.next_token(); // consume comma
+            self.next_token(); // start of next expr
+            exprs.push(self.parse_expression(Precedence::Lowest)?);
+        }
+        Some(Expression::Sequence(exprs))
     }
 
     fn expect_peek(&mut self, token_type: TokenType) -> bool {

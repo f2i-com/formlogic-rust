@@ -52,6 +52,11 @@ pub struct RCompiler {
     captured_names: Option<FxHashSet<String>>,
     // Names declared with `const` — assignment to these is a compile error.
     const_bindings: FxHashSet<String>,
+    /// Global slot indices that were freshly allocated because a parameter
+    /// shadows a captured name from the outer scope (IIFE pattern).
+    /// Inner closures created in this scope that reference these slots need
+    /// `MakeClosure` to snapshot the values at creation time.
+    param_shadow_slots: FxHashSet<u16>,
 }
 
 struct LoopContext {
@@ -64,6 +69,14 @@ struct LoopContext {
 struct TryContext {
     exception_temp: String,
     throw_jumps: Vec<usize>,
+    /// When a try block has a finally, returns inside try/catch are deferred:
+    /// the return value is stored in `return_temp` and control jumps to the
+    /// finally block. After finally executes, if `return_flag_temp` is true,
+    /// the actual return happens.
+    has_finally: bool,
+    return_temp: Option<String>,
+    return_flag_temp: Option<String>,
+    return_jumps: Vec<usize>,
 }
 
 impl RCompiler {
@@ -88,6 +101,7 @@ impl RCompiler {
             next_cache_slot: 0,
             captured_names: None,
             const_bindings: FxHashSet::default(),
+            param_shadow_slots: FxHashSet::default(),
         }
     }
 
@@ -109,7 +123,7 @@ impl RCompiler {
     }
 
     fn new_function_scope(
-        globals: FxHashMap<String, u16>,
+        mut globals: FxHashMap<String, u16>,
         next_global: u16,
         parameters: &[String],
         captured_names: FxHashSet<String>,
@@ -117,6 +131,15 @@ impl RCompiler {
         let mut locals = FxHashMap::default();
         for (i, param) in parameters.iter().enumerate() {
             locals.insert(param.clone(), i as u16);
+            // If a parameter shadows a captured variable from the outer scope,
+            // remove the old global slot so that ensure_global_slot allocates a
+            // fresh one.  This is necessary for IIFE patterns like
+            //   (i => () => i)(i)
+            // where the inner closure must capture from the IIFE's own scope,
+            // not the outer loop variable.
+            if captured_names.contains(param) {
+                globals.remove(param);
+            }
         }
         let num_locals = parameters.len() as u16;
 
@@ -140,6 +163,7 @@ impl RCompiler {
             next_cache_slot: 0,
             captured_names: Some(captured_names),
             const_bindings: FxHashSet::default(),
+            param_shadow_slots: FxHashSet::default(),
         }
     }
 
@@ -306,10 +330,43 @@ impl RCompiler {
             }
             Statement::Return { value } => {
                 let r = self.compile_expression(value)?;
+                // If inside a try-with-finally, defer the return
+                if let Some(ctx) = self.try_stack.last() {
+                    if ctx.has_finally {
+                        if let (Some(ref rt), Some(ref rf)) = (ctx.return_temp.clone(), ctx.return_flag_temp.clone()) {
+                            self.store_identifier(&rt, r)?;
+                            let true_r = self.alloc_temp();
+                            self.emit(ROp::LoadTrue, &[true_r as u16]);
+                            self.store_identifier(&rf, true_r)?;
+                            let jmp = self.emit(ROp::Jump, &[9999]);
+                            // Store the jump position on the try context
+                            let ctx_mut = self.try_stack.last_mut().unwrap();
+                            ctx_mut.return_jumps.push(jmp);
+                            return Ok(None);
+                        }
+                    }
+                }
                 self.emit(ROp::Return, &[r as u16]);
                 Ok(None)
             }
             Statement::ReturnVoid => {
+                // If inside a try-with-finally, defer the return
+                if let Some(ctx) = self.try_stack.last() {
+                    if ctx.has_finally {
+                        if let (Some(ref rt), Some(ref rf)) = (ctx.return_temp.clone(), ctx.return_flag_temp.clone()) {
+                            let undef_r = self.alloc_temp();
+                            self.emit(ROp::LoadUndef, &[undef_r as u16]);
+                            self.store_identifier(&rt, undef_r)?;
+                            let true_r = self.alloc_temp();
+                            self.emit(ROp::LoadTrue, &[true_r as u16]);
+                            self.store_identifier(&rf, true_r)?;
+                            let jmp = self.emit(ROp::Jump, &[9999]);
+                            let ctx_mut = self.try_stack.last_mut().unwrap();
+                            ctx_mut.return_jumps.push(jmp);
+                            return Ok(None);
+                        }
+                    }
+                }
                 self.emit(ROp::ReturnUndef, &[]);
                 Ok(None)
             }
@@ -318,6 +375,16 @@ impl RCompiler {
                 Ok(Some(r))
             }
             Statement::Block(statements) => {
+                let shadowed = self.enter_block_scope(statements);
+                let mut last = None;
+                for s in statements {
+                    last = self.compile_statement(s)?;
+                }
+                self.exit_block_scope(shadowed);
+                Ok(last)
+            }
+            Statement::MultiLet(statements) => {
+                // Multi-declaration: let a = 1, b = 2; — no block scoping
                 let mut last = None;
                 for s in statements {
                     last = self.compile_statement(s)?;
@@ -371,6 +438,7 @@ impl RCompiler {
                     body: body.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    is_arrow: false,
                 };
                 let r = self.compile_expression(&function_expr)?;
                 self.store_binding(name, r)?;
@@ -386,6 +454,24 @@ impl RCompiler {
                     Some(Expression::Identifier(s)) => Some(s.as_str()),
                     _ => None,
                 };
+                // Pre-register class name in globals so methods can reference
+                // the class via the same global slot (e.g., static methods that
+                // reference the class by name like `Counter.count`).
+                // Only do this for non-function scope where store_binding uses
+                // globals directly, OR ensure we also pre-register the local.
+                if let Some(n) = name {
+                    if self.is_function_scope {
+                        // In function scope, store_binding will create a local AND
+                        // mirror to global. Pre-register both so child compilers
+                        // see the same slot for the class name.
+                        self.ensure_local(n);
+                        if self.needs_global(n) {
+                            let _ = self.ensure_global_slot(n);
+                        }
+                    } else {
+                        let _ = self.ensure_global_slot(n);
+                    }
+                }
                 let class_obj = self.compile_class_literal(class_name, extends_name, members)?;
                 if let Some(n) = name {
                     self.class_defs.insert(n.clone(), class_obj.clone());
@@ -413,13 +499,13 @@ impl RCompiler {
                 catch_block,
                 finally_block,
             } => {
-                self.compile_try_statement(
+                let r = self.compile_try_statement(
                     try_block,
                     catch_param.as_deref(),
                     catch_block.as_deref(),
                     finally_block.as_deref(),
                 )?;
-                Ok(None)
+                Ok(r)
             }
             Statement::Labeled { label, statement } => match statement.as_ref() {
                 Statement::While { condition, body } => {
@@ -690,16 +776,26 @@ impl RCompiler {
                 body,
                 is_async,
                 is_generator,
+                is_arrow,
             } => {
+                let takes_this = !is_arrow;
                 let func_obj = self.compile_function_literal(
                     parameters,
                     body,
-                    true,
+                    takes_this,
                     *is_async,
                     *is_generator,
                 )?;
+                let captures = func_obj.closure_captures.clone();
                 let idx = self.add_constant(Object::CompiledFunction(Box::new(func_obj)));
-                self.emit(ROp::LoadConst, &[dst as u16, idx]);
+                if captures.is_empty() {
+                    self.emit(ROp::LoadConst, &[dst as u16, idx]);
+                } else {
+                    // Emit MakeClosure: [dst, const_idx, count, slot0, slot1, ...]
+                    let mut operands = vec![dst as u16, idx, captures.len() as u16];
+                    operands.extend_from_slice(&captures);
+                    self.emit(ROp::MakeClosure, &operands);
+                }
             }
             Expression::Await { value } => {
                 let src = self.compile_expression(value)?;
@@ -708,6 +804,17 @@ impl RCompiler {
             Expression::Yield { value, delegate: _ } => {
                 let src = self.compile_expression(value)?;
                 self.emit(ROp::Yield, &[dst as u16, src as u16]);
+            }
+            Expression::Sequence(exprs) => {
+                // Evaluate all expressions, result of last goes into dst
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i == exprs.len() - 1 {
+                        self.compile_expression_into(expr, dst)?;
+                    } else {
+                        let tmp = self.compile_expression(expr)?;
+                        let _ = tmp; // discard
+                    }
+                }
             }
             Expression::New { callee, arguments } => {
                 self.compile_new_into(callee, arguments, dst)?;
@@ -1121,6 +1228,51 @@ impl RCompiler {
             }
         }
 
+        // Optional method call: obj?.method(args) — short-circuit to undefined when nullish
+        if let Expression::OptionalIndex { left, index } = function {
+            if let Expression::String(prop_name) = index.as_ref() {
+                let base = self.next_temp;
+                let obj_r = self.alloc_temp();
+                self.compile_expression_into(left, obj_r)?;
+
+                // Check nullish
+                let nullish = self.alloc_temp();
+                self.emit(ROp::IsNullish, &[nullish as u16, obj_r as u16]);
+                let not_null_pos = self.emit(ROp::JumpIfNot, &[nullish as u16, 9999]);
+                self.emit(ROp::LoadUndef, &[dst]);
+                let end_pos = self.emit(ROp::Jump, &[9999]);
+
+                let call_pos = self.instructions.len();
+                self.patch_jump(not_null_pos, call_pos);
+
+                // Not nullish — do the method call
+                for (i, arg) in arguments.iter().enumerate() {
+                    self.next_temp = (base as usize + 1 + i) as u16;
+                    let r = self.alloc_temp();
+                    self.compile_expression_into(arg, r)?;
+                }
+                self.next_temp = (base as usize + 1 + arguments.len()) as u16;
+                let const_idx = self.add_constant_string(Rc::from(prop_name.as_str()));
+                let cache_slot = self.next_cache_slot;
+                self.next_cache_slot += 1;
+                self.emit(
+                    ROp::CallMethod,
+                    &[
+                        call_dst as u16,
+                        base as u16,
+                        arguments.len() as u16,
+                        const_idx,
+                        cache_slot,
+                    ],
+                );
+                self.reload_and_move_result(call_dst, dst);
+
+                let end = self.instructions.len();
+                self.patch_jump(end_pos, end);
+                return Ok(());
+            }
+        }
+
         // General call: pack func + args in contiguous registers
         let base = self.next_temp;
         let func_r = self.alloc_temp();
@@ -1233,11 +1385,13 @@ impl RCompiler {
             self.emit(ROp::JumpIfNot, &[cond as u16, 9999])
         };
 
-        // Consequence: compile statements, last expression value → dst
+        // Consequence: compile statements with block scoping
+        let shadowed = self.enter_block_scope(consequence);
         let mut last = None;
         for stmt in consequence {
             last = self.compile_statement(stmt)?;
         }
+        self.exit_block_scope(shadowed);
         if let Some(r) = last {
             if r != dst {
                 self.emit(ROp::Move, &[dst as u16, r as u16]);
@@ -1249,10 +1403,12 @@ impl RCompiler {
         self.patch_jump(jump_pos, after_cons);
 
         if let Some(alt_block) = alternative {
+            let shadowed = self.enter_block_scope(alt_block);
             let mut last = None;
             for stmt in alt_block {
                 last = self.compile_statement(stmt)?;
             }
+            self.exit_block_scope(shadowed);
             if let Some(r) = last {
                 if r != dst {
                     self.emit(ROp::Move, &[dst as u16, r as u16]);
@@ -1298,10 +1454,12 @@ impl RCompiler {
             body
         };
 
+        let shadowed = self.enter_block_scope(body);
         for stmt in body_to_compile {
             self.compile_statement(stmt)?;
             self.next_temp = self.num_locals; // free temps each iteration
         }
+        self.exit_block_scope(shadowed);
 
         if let Some((reg, const_idx, _)) = fused_increment {
             self.emit(
@@ -1340,10 +1498,12 @@ impl RCompiler {
             continue_positions: vec![],
         });
 
+        let shadowed = self.enter_block_scope(body);
         for stmt in body {
             self.compile_statement(stmt)?;
             self.next_temp = self.num_locals;
         }
+        self.exit_block_scope(shadowed);
 
         // continue jumps to the condition
         let condition_start = self.instructions.len();
@@ -1474,10 +1634,12 @@ impl RCompiler {
             continue_positions: vec![],
         });
 
+        let shadowed = self.enter_block_scope(body);
         for stmt in body {
             self.compile_statement(stmt)?;
             self.next_temp = self.num_locals;
         }
+        self.exit_block_scope(shadowed);
 
         let update_start = self.instructions.len();
         if let Some(loop_ctx) = self.loop_stack.last_mut() {
@@ -1538,8 +1700,15 @@ impl RCompiler {
         let iter_name = self.make_temp_name("iter");
         let idx_name = self.make_temp_name("i");
 
-        // iter = iterable
-        let iter_val = self.compile_expression(iterable)?;
+        // iter = Array.from(iterable) — ensures Set, Map, String all become arrays
+        let array_from_expr = Expression::Call {
+            function: Box::new(Expression::Index {
+                left: Box::new(Expression::Identifier("Array".to_string())),
+                index: Box::new(Expression::String("from".to_string())),
+            }),
+            arguments: vec![iterable.clone()],
+        };
+        let iter_val = self.compile_expression(&array_from_expr)?;
         self.store_identifier(&iter_name, iter_val)?;
 
         // i = 0
@@ -1585,9 +1754,11 @@ impl RCompiler {
             }
         }
 
+        let shadowed = self.enter_block_scope(body);
         for stmt in body {
             self.compile_statement(stmt)?;
         }
+        self.exit_block_scope(shadowed);
 
         let update_start = self.instructions.len();
         if let Some(loop_ctx) = self.loop_stack.last_mut() {
@@ -1666,9 +1837,11 @@ impl RCompiler {
         let key = self.compile_expression(&key_expr)?;
         self.store_identifier(var_name, key)?;
 
+        let shadowed = self.enter_block_scope(body);
         for stmt in body {
             self.compile_statement(stmt)?;
         }
+        self.exit_block_scope(shadowed);
 
         let update_start = self.instructions.len();
         if let Some(loop_ctx) = self.loop_stack.last_mut() {
@@ -1799,7 +1972,9 @@ impl RCompiler {
         let nullish = self.alloc_temp();
         self.emit(ROp::IsNullish, &[nullish as u16, func as u16]);
         let not_null_pos = self.emit(ROp::JumpIfNot, &[nullish as u16, 9999]);
-        self.emit(ROp::LoadUndef, &[call_dst as u16]);
+        // Null case: write undefined directly to final dst (not call_dst)
+        // so the result is correct when we jump past the call+move path.
+        self.emit(ROp::LoadUndef, &[dst]);
         let end_pos = self.emit(ROp::Jump, &[9999]);
 
         let call_pos = self.instructions.len();
@@ -2101,8 +2276,13 @@ impl RCompiler {
         // Fused: obj.prop += CONST → AddConstToRegProp
         if operator == "+=" {
             if let Expression::String(prop) = index {
-                if let Expression::Identifier(name) = object_expr {
-                    if let Some(&obj_r) = self.locals.get(name.as_str()) {
+                let obj_name: Option<&str> = match object_expr {
+                    Expression::Identifier(name) => Some(name.as_str()),
+                    Expression::This => Some("this"),
+                    _ => None,
+                };
+                if let Some(name) = obj_name {
+                    if let Some(&obj_r) = self.locals.get(name) {
                         if let Some(val_const) = self.try_numeric_const(right) {
                             let prop_const = self.add_constant_string(Rc::from(prop.as_str()));
                             let cache_slot = self.next_cache_slot;
@@ -2232,6 +2412,45 @@ impl RCompiler {
                     }
                 }
             }
+        }
+
+        // Handle short-circuit logical assignment operators for index targets
+        if operator == "||=" || operator == "&&=" || operator == "??=" {
+            let obj = self.compile_expression(object_expr)?;
+            let key = self.compile_expression(index)?;
+            let old = self.alloc_temp();
+            self.emit(ROp::Index, &[old as u16, obj as u16, key as u16]);
+
+            let skip_jump = match operator {
+                "||=" => self.emit(ROp::JumpIfTruthy, &[old as u16, 9999]),
+                "&&=" => self.emit(ROp::JumpIfNot, &[old as u16, 9999]),
+                "??=" => {
+                    // IsNullish then JumpIfNot (skip if NOT nullish, i.e. keep existing value)
+                    let is_null = self.alloc_temp();
+                    self.emit(ROp::IsNullish, &[is_null as u16, old as u16]);
+                    self.emit(ROp::JumpIfNot, &[is_null as u16, 9999])
+                }
+                _ => unreachable!(),
+            };
+            let rhs = self.compile_expression(right)?;
+            self.emit(ROp::SetIndex, &[obj as u16, key as u16, rhs as u16]);
+            // Write back to original local if needed
+            let orig_local = match object_expr {
+                Expression::Identifier(name) => self.locals.get(name.as_str()).copied(),
+                Expression::This => self.locals.get("this").copied(),
+                _ => None,
+            };
+            if let Some(local_r) = orig_local {
+                if local_r as u16 != obj as u16 {
+                    self.emit(ROp::Move, &[local_r as u16, obj as u16]);
+                }
+            }
+            self.emit(ROp::Move, &[dst, rhs as u16]);
+            let end = self.instructions.len();
+            self.patch_jump(skip_jump, end);
+            // If we skipped, dst should be old value
+            self.emit(ROp::Move, &[dst, old as u16]);
+            return Ok(());
         }
 
         // General case: obj[key] op= right
@@ -2513,6 +2732,7 @@ impl RCompiler {
                     out.extend(names);
                 }
                 Statement::Block(body)
+                | Statement::MultiLet(body)
                 | Statement::While { body, .. }
                 | Statement::DoWhile { body, .. } => {
                     Self::collect_var_names(body, out);
@@ -2862,20 +3082,40 @@ impl RCompiler {
         catch_param: Option<&str>,
         catch_block: Option<&[Statement]>,
         finally_block: Option<&[Statement]>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u16>, String> {
         let exception_temp = self.make_temp_name("exc");
         // Initialize exception temp to null
         let null_r = self.alloc_temp();
         self.emit(ROp::LoadNull, &[null_r as u16]);
         self.store_identifier(&exception_temp, null_r)?;
 
+        let has_finally = finally_block.is_some();
+        let (return_temp, return_flag_temp) = if has_finally {
+            let rt = self.make_temp_name("ret_val");
+            let rf = self.make_temp_name("ret_flag");
+            // Initialize return flag to false
+            let false_r = self.alloc_temp();
+            self.emit(ROp::LoadFalse, &[false_r as u16]);
+            self.store_identifier(&rf, false_r)?;
+            (Some(rt), Some(rf))
+        } else {
+            (None, None)
+        };
+
         self.try_stack.push(TryContext {
             exception_temp: exception_temp.clone(),
             throw_jumps: vec![],
+            has_finally,
+            return_temp: return_temp.clone(),
+            return_flag_temp: return_flag_temp.clone(),
+            return_jumps: vec![],
         });
 
+        let mut last_reg: Option<u16> = None;
         for stmt in try_block {
-            self.compile_statement(stmt)?;
+            if let Some(r) = self.compile_statement(stmt)? {
+                last_reg = Some(r);
+            }
         }
 
         let jump_after_try = self.emit(ROp::Jump, &[9999]);
@@ -2890,14 +3130,37 @@ impl RCompiler {
             self.patch_jump(pos, catch_start);
         }
 
+        // Keep return_jumps from the try block
+        let mut all_return_jumps = ctx.return_jumps;
+
         if let Some(catch_stmts) = catch_block {
+            // Push a context for the catch block so returns inside catch are
+            // also deferred to the finally block.
+            if has_finally {
+                self.try_stack.push(TryContext {
+                    exception_temp: exception_temp.clone(),
+                    throw_jumps: vec![],
+                    has_finally: true,
+                    return_temp: return_temp.clone(),
+                    return_flag_temp: return_flag_temp.clone(),
+                    return_jumps: vec![],
+                });
+            }
             if let Some(param) = catch_param {
                 let exc =
                     self.compile_expression(&Expression::Identifier(exception_temp.clone()))?;
                 self.store_identifier(param, exc)?;
             }
             for stmt in catch_stmts {
-                self.compile_statement(stmt)?;
+                if let Some(r) = self.compile_statement(stmt)? {
+                    last_reg = Some(r);
+                }
+            }
+            // Pop the catch context and collect return jumps
+            if has_finally {
+                if let Some(catch_ctx) = self.try_stack.pop() {
+                    all_return_jumps.extend(catch_ctx.return_jumps);
+                }
             }
         }
 
@@ -2906,6 +3169,20 @@ impl RCompiler {
             for stmt in finally_stmts {
                 self.compile_statement(stmt)?;
             }
+            // After finally block: check if a deferred return is pending
+            if let (Some(ref rf), Some(ref rt)) = (&return_flag_temp, &return_temp) {
+                let flag_r = self.compile_expression(&Expression::Identifier(rf.clone()))?;
+                let skip_return = self.emit(ROp::JumpIfNot, &[flag_r as u16, 9999]);
+                let val_r = self.compile_expression(&Expression::Identifier(rt.clone()))?;
+                self.emit(ROp::Return, &[val_r as u16]);
+                let end = self.instructions.len();
+                self.patch_jump(skip_return, end);
+            }
+        }
+
+        // Patch return_jumps from try/catch to finally start
+        for pos in all_return_jumps {
+            self.patch_jump(pos, finally_start);
         }
 
         let end = self.instructions.len();
@@ -2914,7 +3191,7 @@ impl RCompiler {
         } else {
             self.patch_jump(jump_after_try, end);
         }
-        Ok(())
+        Ok(last_reg)
     }
 
     // ── Delete ───────────────────────────────────────────────────────────
@@ -2995,10 +3272,43 @@ impl RCompiler {
             captured,
         );
 
+        // Mirror captured parameters to global slots so inner functions can
+        // read them via GetGlobal.  Without this, parameters stay in registers
+        // only and nested closures see uninitialised globals.
+        {
+            let params_to_mirror: Vec<(u16, String)> = effective_params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| fn_compiler.needs_global(p))
+                .map(|(i, p)| (i as u16, p.clone()))
+                .collect();
+            for (reg, name) in params_to_mirror {
+                let is_new = !fn_compiler.globals.contains_key(&name);
+                let g = fn_compiler.ensure_global_slot(&name)?;
+                fn_compiler.emit(ROp::SetGlobal, &[g, reg]);
+                // If this is a freshly allocated slot (parameter shadowed an
+                // outer variable), mark it so inner closures use MakeClosure.
+                if is_new {
+                    fn_compiler.param_shadow_slots.insert(g);
+                }
+            }
+        }
+
         fn_compiler.hoist_var_declarations(body)?;
+
+        // Hoist function declarations to top of function body (JS semantics)
+        for stmt in body.iter() {
+            if matches!(stmt, Statement::FunctionDecl { .. }) {
+                fn_compiler.compile_statement(stmt)?;
+                fn_compiler.next_temp = fn_compiler.num_locals;
+            }
+        }
 
         let mut last_reg = None;
         for stmt in body {
+            if matches!(stmt, Statement::FunctionDecl { .. }) {
+                continue; // already compiled above
+            }
             last_reg = fn_compiler.compile_statement(stmt)?;
             fn_compiler.next_temp = fn_compiler.num_locals;
         }
@@ -3018,6 +3328,21 @@ impl RCompiler {
         if fn_compiler.next_global > self.next_global {
             self.next_global = fn_compiler.next_global;
         }
+
+        // Determine which global slots from the parent's param_shadow_slots are
+        // referenced by this function (or its nested closures). These need to be
+        // captured at closure creation time via MakeClosure.
+        let closure_captures: Vec<u16> = if !self.param_shadow_slots.is_empty() {
+            fn_compiler
+                .globals
+                .values()
+                .copied()
+                .filter(|slot| self.param_shadow_slots.contains(slot))
+                .collect()
+        } else {
+            vec![]
+        };
+
         for (name, idx) in &fn_compiler.globals {
             self.globals.entry(name.clone()).or_insert(*idx);
         }
@@ -3038,6 +3363,8 @@ impl RCompiler {
                 (0, 0);
                 fn_compiler.next_cache_slot as usize
             ])),
+            closure_captures,
+            captured_values: vec![],
         })
     }
 
@@ -3058,6 +3385,7 @@ impl RCompiler {
             super_methods: FxHashMap::default(),
             super_getters: FxHashMap::default(),
             super_setters: FxHashMap::default(),
+            super_constructor_chain: vec![],
             field_initializers: vec![],
             static_initializers: vec![],
             static_fields: FxHashMap::default(),
@@ -3075,6 +3403,18 @@ impl RCompiler {
                 }
                 class_obj.super_getters = parent.getters.clone();
                 class_obj.super_setters = parent.setters.clone();
+                // Build the constructor chain for multi-level super() calls.
+                // Chain[0] = grandparent (parent's super), chain[1] = great-grandparent, etc.
+                if !parent.super_methods.is_empty() {
+                    class_obj.super_constructor_chain.push((
+                        parent.super_methods.clone(),
+                        parent.super_getters.clone(),
+                        parent.super_setters.clone(),
+                    ));
+                    class_obj
+                        .super_constructor_chain
+                        .extend(parent.super_constructor_chain.clone());
+                }
                 for (k, v) in &parent.methods {
                     class_obj.methods.entry(k.clone()).or_insert(v.clone());
                 }
@@ -3212,6 +3552,34 @@ impl RCompiler {
             self.emit(ROp::SetGlobal, &[g, src as u16]);
         }
         Ok(())
+    }
+
+    /// Prepare block scoping: remove let/const names from locals so they get
+    /// fresh registers inside the block.  Returns the saved (name, old_reg)
+    /// pairs that must be restored after the block.
+    fn enter_block_scope(&mut self, stmts: &[Statement]) -> Vec<(String, Option<u16>)> {
+        let mut shadowed = Vec::new();
+        for s in stmts {
+            match s {
+                Statement::Let { name, kind, .. } if *kind != VariableKind::Var => {
+                    let old = self.locals.remove(name);
+                    shadowed.push((name.clone(), old));
+                }
+                _ => {}
+            }
+        }
+        shadowed
+    }
+
+    /// Restore bindings saved by `enter_block_scope`.
+    fn exit_block_scope(&mut self, shadowed: Vec<(String, Option<u16>)>) {
+        for (name, old_reg) in shadowed {
+            if let Some(r) = old_reg {
+                self.locals.insert(name, r);
+            } else {
+                self.locals.remove(&name);
+            }
+        }
     }
 
     fn ensure_binding_register(&mut self, name: &str) -> Result<u16, String> {
@@ -3467,6 +3835,90 @@ fn scan_captured_names(stmts: &[Statement]) -> FxHashSet<String> {
     captured
 }
 
+/// Check if a function body uses `this` (directly, not inside nested non-arrow functions).
+/// Uses the existing scan_expr_captures infrastructure with a sentinel set.
+fn scan_body_uses_this(stmts: &[Statement]) -> bool {
+    let mut out = FxHashSet::default();
+    for stmt in stmts {
+        scan_stmt_captures(stmt, &mut out, true);
+        // Also check for Expression::This directly in statements
+        scan_stmt_for_this(stmt, &mut out);
+    }
+    out.contains("this")
+}
+
+fn scan_stmt_for_this(stmt: &Statement, out: &mut FxHashSet<String>) {
+    match stmt {
+        Statement::Expression(expr) => scan_expr_for_this(expr, out),
+        Statement::Let { value, .. } | Statement::LetPattern { value, .. } => {
+            scan_expr_for_this(value, out)
+        }
+        Statement::Return { value } => scan_expr_for_this(value, out),
+        Statement::Block(stmts) | Statement::MultiLet(stmts) => {
+            for s in stmts {
+                scan_stmt_for_this(s, out);
+            }
+        }
+        _ => {
+            // For other statement types, walk children
+            // We rely on the fact that Expression::This in expression statements
+            // is the most common case
+        }
+    }
+}
+
+fn scan_expr_for_this(expr: &Expression, out: &mut FxHashSet<String>) {
+    match expr {
+        Expression::This => {
+            out.insert("this".to_string());
+        }
+        Expression::Function { is_arrow, body, .. } => {
+            // Arrow functions inherit `this`, so keep scanning.
+            // Regular functions have their own `this`, stop.
+            if *is_arrow {
+                for s in body {
+                    scan_stmt_for_this(s, out);
+                }
+            }
+        }
+        Expression::Prefix { right, .. } => scan_expr_for_this(right, out),
+        Expression::Infix { left, right, .. } | Expression::Assign { left, right, .. } => {
+            scan_expr_for_this(left, out);
+            scan_expr_for_this(right, out);
+        }
+        Expression::Index { left, index, .. } => {
+            scan_expr_for_this(left, out);
+            scan_expr_for_this(index, out);
+        }
+        Expression::Call { function, arguments, .. }
+        | Expression::OptionalCall { function, arguments, .. } => {
+            scan_expr_for_this(function, out);
+            for arg in arguments {
+                scan_expr_for_this(arg, out);
+            }
+        }
+        Expression::Array(items) => {
+            for item in items {
+                scan_expr_for_this(item, out);
+            }
+        }
+        Expression::If { condition, consequence, alternative } => {
+            scan_expr_for_this(condition, out);
+            for s in consequence {
+                scan_stmt_for_this(s, out);
+            }
+            if let Some(alt) = alternative {
+                for s in alt {
+                    scan_stmt_for_this(s, out);
+                }
+            }
+        }
+        Expression::Spread { value } => scan_expr_for_this(value, out),
+        Expression::Update { target, .. } => scan_expr_for_this(target, out),
+        _ => {}
+    }
+}
+
 fn scan_stmt_captures(stmt: &Statement, out: &mut FxHashSet<String>, in_func: bool) {
     match stmt {
         Statement::Let { value, .. } => {
@@ -3482,7 +3934,7 @@ fn scan_stmt_captures(stmt: &Statement, out: &mut FxHashSet<String>, in_func: bo
         Statement::Expression(expr) => {
             scan_expr_captures(expr, out, in_func);
         }
-        Statement::Block(stmts) => {
+        Statement::Block(stmts) | Statement::MultiLet(stmts) => {
             for s in stmts {
                 scan_stmt_captures(s, out, in_func);
             }
@@ -3665,6 +4117,11 @@ fn scan_expr_captures(expr: &Expression, out: &mut FxHashSet<String>, in_func: b
         Expression::Yield { value, .. } => {
             scan_expr_captures(value, out, in_func);
         }
+        Expression::Sequence(exprs) => {
+            for e in exprs {
+                scan_expr_captures(e, out, in_func);
+            }
+        }
         Expression::Infix { left, right, .. } => {
             scan_expr_captures(left, out, in_func);
             scan_expr_captures(right, out, in_func);
@@ -3684,7 +4141,14 @@ fn scan_expr_captures(expr: &Expression, out: &mut FxHashSet<String>, in_func: b
                 }
             }
         }
-        Expression::Function { body, .. } => {
+        Expression::Function { body, is_arrow, .. } => {
+            if *is_arrow {
+                // Arrow functions capture `this` from the enclosing scope.
+                // Scan body for `this` references and add them as captures.
+                if scan_body_uses_this(body) {
+                    out.insert("this".to_string());
+                }
+            }
             // Everything inside a function body is "inside a function"
             for s in body {
                 scan_stmt_captures(s, out, true);

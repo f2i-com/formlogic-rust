@@ -181,6 +181,12 @@ pub enum ROp {
     /// is written to `dst`.
     Yield,
 
+    // ── Closures ──────────────────────────────────────────────────────────
+    /// Create a closure by snapshotting captured global slots.
+    /// [dst:2, const_idx:2, count:1]
+    /// Followed by `count` pairs of [slot:2] — the global slot indices to capture.
+    MakeClosure,
+
     // ── Halt ──────────────────────────────────────────────────────────────
     /// Halt execution (no result).  []
     Halt,
@@ -249,6 +255,9 @@ impl ROp {
             AddRegPropsToRegProp => 14,
             // [hash:2, func:2, prop_const:2, kind:1]
             DefineAccessor => 7,
+            // [dst:2, const_idx:2, count:1] + count*2 variable bytes
+            // Note: operand_bytes returns just the fixed part; callers must add count*2.
+            MakeClosure => 5,
             // [dst:2, obj:2, prop:2, cache:2]
             GetProp => 8,
             // [obj:2, prop:2, src:2, cache:2]
@@ -295,6 +304,9 @@ pub fn rmake(op: ROp, operands: &[u16]) -> Vec<u8> {
         AddConstToRegProp => &[2, 2, 2, 2],
         AddRegPropsToRegProp => &[2, 2, 2, 2, 2, 2, 2],
         DefineAccessor => &[2, 2, 2, 1],
+        // Variable-length: [dst:2, const_idx:2, count:1, slot0:2, slot1:2, ...]
+        // rmake handles this specially below
+        MakeClosure => &[2, 2, 1],
     };
 
     let mut len = 1usize;
@@ -318,5 +330,14 @@ pub fn rmake(op: ROp, operands: &[u16]) -> Vec<u8> {
         }
         offset += width;
     }
+
+    // Variable-length tail for MakeClosure: append slot indices as u16 big-endian
+    if op == MakeClosure && operands.len() > 3 {
+        for &slot in &operands[3..] {
+            out.push(((slot >> 8) & 0xff) as u8);
+            out.push((slot & 0xff) as u8);
+        }
+    }
+
     out
 }

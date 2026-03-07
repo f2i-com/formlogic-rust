@@ -345,6 +345,7 @@ pub enum BuiltinFunction {
     StringReplace,
     StringReplaceAll,
     NumberToFixed,
+    NumberToPrecision,
     NumberToString,
     ParseInt,
     ParseFloat,
@@ -361,6 +362,10 @@ pub enum BuiltinFunction {
     ObjectHasOwn,
     ObjectIs,
     ObjectAssign,
+    ObjectFreeze,
+    ObjectCreate,
+    ArrayOf,
+    HashHasOwnProperty,
     JsonStringify,
     JsonParse,
     PromiseResolve,
@@ -380,6 +385,7 @@ pub enum BuiltinFunction {
     ArraySort,
     ArrayFilter,
     ArrayReduce,
+    ArrayReduceRight,
     ArrayFind,
     ArrayIncludes,
     ArrayJoin,
@@ -392,11 +398,27 @@ pub enum BuiltinFunction {
     ArrayKeys,
     ArrayValues,
     ArrayEntries,
+    ArrayShift,
+    ArrayUnshift,
+    ArraySplice,
+    ArrayConcat,
     ArrayFrom,
+    ArrayIsArray,
+    ArrayFill,
+    ArrayCopyWithin,
+    ArrayFindLast,
+    ArrayFindLastIndex,
+    ArrayToReversed,
     RegExpCtor,
     RegExpTest,
+    RegExpExec,
     StringMatch,
     StringMatchAll,
+    StringSearch,
+    StringConcat,
+    StringTrimStart,
+    StringTrimEnd,
+    StringFromCodePoint,
     MapCtor,
     MapSet,
     MapGet,
@@ -516,6 +538,14 @@ pub enum BuiltinFunction {
     // ── Generic host call bridge ──
     /// host.call(kind, argsArray, callback) — queues an async call to the host.
     HostCall,
+
+    // ── Error constructor ──
+    ErrorConstructor,
+    StringAt,
+    StringCodePointAt,
+    StringNormalize,
+    StringRaw,
+    StructuredClone,
 }
 
 #[derive(Clone, Debug)]
@@ -543,6 +573,12 @@ pub struct CompiledFunctionObject {
     /// `cache_slot`.  `Rc` ensures all clones of this function (including
     /// `BoundMethod` wrappers) share the same warm cache.
     pub inline_cache: Rc<VmCell<Vec<(u32, u32)>>>,
+    /// Global slot indices that inner closures need to capture at creation time.
+    /// Set by the compiler for functions that contain captured parameters.
+    pub closure_captures: Vec<u16>,
+    /// Captured global slot values, snapshotted at closure creation time.
+    /// Set by the VM's MakeClosure opcode.
+    pub captured_values: Vec<(u16, Value)>,
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +658,13 @@ pub struct GeneratorObject {
     pub state: GeneratorState,
 }
 
+/// One level of super methods/getters/setters for multi-level inheritance chains.
+pub type SuperLevel = (
+    FxHashMap<String, CompiledFunctionObject>,
+    FxHashMap<String, CompiledFunctionObject>,
+    FxHashMap<String, CompiledFunctionObject>,
+);
+
 #[derive(Clone, Debug)]
 pub struct ClassObject {
     pub name: String,
@@ -634,6 +677,9 @@ pub struct ClassObject {
     pub super_methods: FxHashMap<String, CompiledFunctionObject>,
     pub super_getters: FxHashMap<String, CompiledFunctionObject>,
     pub super_setters: FxHashMap<String, CompiledFunctionObject>,
+    /// Chain of ancestor super levels for multi-level inheritance.
+    /// `super_constructor_chain[0]` = grandparent methods, `[1]` = great-grandparent, etc.
+    pub super_constructor_chain: Vec<SuperLevel>,
     /// Instance field initializers: `(name, initializer_fn)`.
     /// Each initializer is a zero-arg `takes_this=true` function whose return
     /// value is the field's initial value.  Executed in order during `new`.
@@ -668,6 +714,8 @@ pub struct InstanceObject {
     pub super_methods: FxHashMap<String, CompiledFunctionObject>,
     pub super_getters: FxHashMap<String, CompiledFunctionObject>,
     pub super_setters: FxHashMap<String, CompiledFunctionObject>,
+    /// Remaining ancestor chain for multi-level super() constructor calls.
+    pub super_constructor_chain: Vec<SuperLevel>,
 }
 
 #[derive(Clone, Debug)]
@@ -682,6 +730,8 @@ pub struct SuperRefObject {
     pub methods: FxHashMap<String, CompiledFunctionObject>,
     pub getters: FxHashMap<String, CompiledFunctionObject>,
     pub setters: FxHashMap<String, CompiledFunctionObject>,
+    /// Remaining ancestor chain so nested super() calls resolve correctly.
+    pub constructor_chain: Vec<SuperLevel>,
 }
 
 #[derive(Clone, Debug)]
@@ -703,6 +753,8 @@ pub struct HashObject {
     pub getters: Option<Box<FxHashMap<String, CompiledFunctionObject>>>,
     /// Setter accessor functions defined on this object (e.g. `{ set x(v) { ... } }`).
     pub setters: Option<Box<FxHashMap<String, CompiledFunctionObject>>>,
+    /// True when Object.freeze() has been called on this object.
+    pub frozen: bool,
 }
 
 impl Default for HashObject {
@@ -717,6 +769,7 @@ impl Default for HashObject {
             local_objects: Vec::new(),
             getters: None,
             setters: None,
+            frozen: false,
         }
     }
 }
@@ -737,6 +790,7 @@ impl HashObject {
             local_objects: Vec::new(),
             getters: None,
             setters: None,
+            frozen: false,
         }
     }
 
@@ -848,6 +902,9 @@ impl HashObject {
 
     /// Update/insert by symbol ID while preserving fast slot layout.
     pub fn set_by_sym(&mut self, sym: u32, value: Value) {
+        if self.frozen {
+            return;
+        }
         self.insert_pair(HashKey::Sym(sym), value);
     }
 
@@ -1058,6 +1115,37 @@ impl Object {
             Object::Generator(_) => "[Generator]".to_string(),
             Object::ReturnValue(v) => v.inspect(),
             Object::Error(err) => format!("{}: {}", err.name, err.message),
+        }
+    }
+
+    /// JavaScript-style ToString conversion for string concatenation.
+    /// Differs from inspect() for arrays (no brackets) and objects ("[object Object]").
+    /// NOTE: Array items are Value (NaN-boxed) so we use inspect_inline() for them,
+    /// which doesn't require heap access. Nested heap arrays will show as "[ref]"
+    /// but this is acceptable for the common case.
+    pub fn to_js_string(&self) -> String {
+        match self {
+            Object::Array(items) => {
+                let borrowed = items.borrow();
+                borrowed
+                    .iter()
+                    .map(|x| {
+                        if x.is_undefined() {
+                            String::new()
+                        } else if x.is_null() {
+                            String::new()
+                        } else {
+                            x.inspect_inline()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+            Object::Hash(_) | Object::Instance(_) => "[object Object]".to_string(),
+            Object::CompiledFunction(_) | Object::BuiltinFunction(_) | Object::BoundMethod(_) => {
+                "function () { [native code] }".to_string()
+            }
+            _ => self.inspect(),
         }
     }
 }

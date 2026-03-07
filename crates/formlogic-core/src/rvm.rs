@@ -693,13 +693,14 @@ impl VM {
                         // Extract function metadata and receiver in one pass.
                         // Use a struct-like tuple to capture everything we need
                         // before dropping the immutable borrow on self.heap.
-                        let (fast, receiver) = {
+                        let (fast, receiver, captured_vals) = {
                             let obj = self.heap.get(idx);
                             match obj {
                                 Object::CompiledFunction(func) if func.register_count > 0 => {
                                     // Raw pointers — zero Rc clones. Safe because:
                                     // - Heap is append-only, function object lives for VM's lifetime
                                     // - Rc inside function keeps underlying data alive
+                                    let cv: Vec<(u16, Value)> = func.captured_values.clone();
                                     (
                                         Some((
                                             func.instructions.as_ptr(),
@@ -715,11 +716,13 @@ impl VM {
                                             func.is_generator,
                                         )),
                                         None,
+                                        cv,
                                     )
                                 }
                                 Object::BoundMethod(bound) if bound.function.register_count > 0 => {
                                     // Clone receiver as owned Object first, convert later
                                     let receiver_obj = *bound.receiver.clone();
+                                    let cv: Vec<(u16, Value)> = bound.function.captured_values.clone();
                                     (
                                         Some((
                                             bound.function.instructions.as_ptr(),
@@ -735,9 +738,10 @@ impl VM {
                                             bound.function.is_generator,
                                         )),
                                         Some(receiver_obj),
+                                        cv,
                                     )
                                 }
-                                _ => (None, None),
+                                _ => (None, None, vec![]),
                             }
                         };
                         // Immutable borrow on self.heap is dropped here.
@@ -780,6 +784,16 @@ impl VM {
                             // Convert receiver (if BoundMethod) now that borrow is released
                             let receiver_val = receiver.map(|r| obj_into_val(r, &mut self.heap));
 
+                            // Inject captured closure values into globals, saving originals
+                            let saved_closure: Vec<(u16, Value)> = captured_vals
+                                .iter()
+                                .map(|&(slot, val)| {
+                                    let old = self.get_global_as_value(slot as usize);
+                                    unsafe { self.globals.set_unchecked(slot as usize, val) };
+                                    (slot, old)
+                                })
+                                .collect();
+
                             self.ip = ip;
                             // SAFETY: pointers derived from heap-allocated CompiledFunctionObject
                             let result = unsafe {
@@ -798,7 +812,14 @@ impl VM {
                                     nargs,
                                     receiver_val,
                                 )
-                            }?;
+                            };
+
+                            // Restore original global values
+                            for (slot, old_val) in saved_closure {
+                                unsafe { self.globals.set_unchecked(slot as usize, old_val) };
+                            }
+
+                            let result = result?;
 
                             unsafe { *regs.add(dst) = result };
                             continue;
@@ -1032,6 +1053,66 @@ impl VM {
                                     let len = arr_rc.borrow().len() as i64;
                                     unsafe { *regs.add(dst) = Value::from_i64(len) };
                                     continue;
+                                } else if prop_sym == self.sym_shift && nargs == 0 {
+                                    let items = arr_rc.borrow_mut();
+                                    if items.is_empty() {
+                                        unsafe { *regs.add(dst) = Value::UNDEFINED };
+                                    } else {
+                                        let first = items.remove(0);
+                                        unsafe { *regs.add(dst) = first };
+                                    }
+                                    continue;
+                                } else if prop_sym == self.sym_unshift && nargs >= 1 {
+                                    let items = arr_rc.borrow_mut();
+                                    for i in (0..nargs).rev() {
+                                        let arg =
+                                            unsafe { *self.stack.get_unchecked(arg_start + i) };
+                                        items.insert(0, arg);
+                                    }
+                                    let len = items.len() as i64;
+                                    unsafe { *regs.add(dst) = Value::from_i64(len) };
+                                    continue;
+                                } else if prop_sym == self.sym_splice {
+                                    let items = arr_rc.borrow_mut();
+                                    let len = items.len() as i64;
+                                    let start_raw = if nargs >= 1 {
+                                        self.to_i32_val(unsafe {
+                                            *self.stack.get_unchecked(arg_start)
+                                        })? as i64
+                                    } else {
+                                        0
+                                    };
+                                    let start = if start_raw < 0 {
+                                        (len + start_raw).max(0) as usize
+                                    } else {
+                                        (start_raw as usize).min(items.len())
+                                    };
+                                    let delete_count = if nargs >= 2 {
+                                        self.to_i32_val(unsafe {
+                                            *self.stack.get_unchecked(arg_start + 1)
+                                        })?
+                                        .max(0) as usize
+                                    } else {
+                                        items.len() - start
+                                    };
+                                    let delete_count = delete_count.min(items.len() - start);
+                                    let removed: Vec<Value> =
+                                        items.drain(start..start + delete_count).collect();
+                                    // Insert new items
+                                    for i in 0..(nargs.saturating_sub(2)) {
+                                        let arg = unsafe {
+                                            *self.stack.get_unchecked(arg_start + 2 + i)
+                                        };
+                                        items.insert(start + i, arg);
+                                    }
+                                    let _ = items;
+                                    unsafe {
+                                        *regs.add(dst) = obj_into_val(
+                                            make_array(removed),
+                                            &mut self.heap,
+                                        )
+                                    };
+                                    continue;
                                 }
                                 // fall through to slow path
                             }
@@ -1249,6 +1330,7 @@ impl VM {
                             methods: instance.super_methods.clone(),
                             getters: instance.super_getters.clone(),
                             setters: instance.super_setters.clone(),
+                            constructor_chain: instance.super_constructor_chain.clone(),
                         }));
                         unsafe { *regs.add(dst) = obj_into_val(result, &mut self.heap) };
                     } else {
@@ -1423,6 +1505,30 @@ impl VM {
                                 ));
                             }
                         }
+                        Object::Generator(gen_rc) => {
+                            // Iterate generator by calling .next() until done
+                            let gen_rc = gen_rc.clone();
+                            loop {
+                                let result = self.execute_generator_next(&gen_rc, Value::UNDEFINED)?;
+                                let result_obj = val_to_obj(result, &self.heap);
+                                match result_obj {
+                                    Object::Hash(h) => {
+                                        let hb = h.borrow();
+                                        let done = hb.get_by_str("done")
+                                            .map(|v| {
+                                                let obj = val_to_obj(v, &self.heap);
+                                                self.is_truthy(&obj)
+                                            })
+                                            .unwrap_or(false);
+                                        if done { break; }
+                                        let value = hb.get_by_str("value")
+                                            .unwrap_or(Value::UNDEFINED);
+                                        arr.borrow_mut().push(value);
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
                         _ => {
                             return Err(VMError::TypeError(
                                 "spread value is not iterable".to_string(),
@@ -1539,6 +1645,9 @@ impl VM {
                             };
                             if let Object::Hash(hash_rc) = heap_obj {
                                 let hash = hash_rc.borrow_mut();
+                                if hash.frozen {
+                                    continue;
+                                }
                                 if cached_shape == hash.shape_version && !hash.has_accessors() {
                                     let slot = cached_offset as usize;
                                     debug_assert!(slot < hash.values.len());
@@ -1738,6 +1847,44 @@ impl VM {
                                 let sym = crate::intern::intern(s);
                                 let val_v = unsafe { *regs.add(val_r) };
                                 hash_rc.borrow_mut().set_by_sym(sym, val_v);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Instance fast path: mutate fields in-place on the heap
+                    // (Instance is Box<InstanceObject>, not Rc, so we must
+                    //  write directly to avoid clone-and-lose semantics.)
+                    if obj_val.is_heap() {
+                        let heap_idx = obj_val.heap_index() as usize;
+                        let is_instance = matches!(
+                            self.heap.objects.get(heap_idx),
+                            Some(Object::Instance(_))
+                        );
+                        if is_instance {
+                            // Extract the string key
+                            let key_str: Option<String> = if key_val.is_heap() {
+                                let key_obj = unsafe {
+                                    &*self.heap.objects.as_ptr().add(key_val.heap_index() as usize)
+                                };
+                                if let Object::String(s) = key_obj {
+                                    Some(s.to_string())
+                                } else {
+                                    None
+                                }
+                            } else if key_val.is_inline_str() {
+                                let (buf, len) = key_val.inline_str_buf();
+                                let s = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+                                Some(s.to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(prop_name) = key_str {
+                                let val_v = unsafe { *regs.add(val_r) };
+                                let val_obj = val_to_obj(val_v, &self.heap);
+                                if let Object::Instance(inst) = &mut self.heap.objects[heap_idx] {
+                                    inst.fields.insert(prop_name, val_obj);
+                                }
                                 continue;
                             }
                         }
@@ -2349,6 +2496,41 @@ impl VM {
                     return Err(VMError::Yield(yielded));
                 }
 
+                ROp::MakeClosure => {
+                    let dst = self.read_u16(ip + 1) as usize;
+                    let const_idx = self.read_u16(ip + 3) as usize;
+                    let count = self.read_u8_at(ip + 5) as usize;
+                    ip += 6; // past fixed part
+
+                    // Read the function from constants and clone it
+                    let func_obj = unsafe { &*self.constants_raw };
+                    let mut func = match &func_obj[const_idx] {
+                        Object::CompiledFunction(f) => (**f).clone(),
+                        _ => {
+                            return Err(VMError::TypeError(
+                                "MakeClosure: not a function".to_string(),
+                            ))
+                        }
+                    };
+
+                    // Snapshot captured global slot values
+                    let mut captured = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let slot = self.read_u16(ip) as usize;
+                        ip += 2;
+                        let val = self.get_global_as_value(slot);
+                        captured.push((slot as u16, val));
+                    }
+                    func.captured_values = captured;
+
+                    // Allocate on heap and store in register
+                    let val = obj_into_val(
+                        Object::CompiledFunction(Box::new(func)),
+                        &mut self.heap,
+                    );
+                    unsafe { *regs.add(dst) = val };
+                }
+
                 ROp::Halt => {
                     return Ok(());
                 }
@@ -2376,6 +2558,9 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn add_slow(&mut self, left: Value, right: Value) -> Result<Value, VMError> {
+        // Check for Instance with valueOf/toString before falling to immutable path
+        let left = self.coerce_instance_for_arithmetic(left)?;
+        let right = self.coerce_instance_for_arithmetic(right)?;
         let lo = val_as_obj_ref(left, &self.heap);
         let ro = val_as_obj_ref(right, &self.heap);
         let result = self.add_objects(&lo, &ro)?;
@@ -2409,6 +2594,13 @@ impl VM {
             let ro_ref = unsafe { &*self.heap.objects.as_ptr().add(right.heap_index() as usize) };
             if let Object::String(b) = ro_ref {
                 self.string_concat_buf.push_str(b);
+            } else if matches!(ro_ref, Object::Instance(_)) {
+                // Instance: call toString() if available.
+                // Save buf since coerce may re-enter string concat.
+                let saved_buf = std::mem::take(&mut self.string_concat_buf);
+                let coerced = self.coerce_to_string_val(right)?;
+                self.string_concat_buf = saved_buf;
+                self.string_concat_buf.push_str(&coerced);
             } else {
                 // string + non-string object → full add
                 let lo = Object::String(Rc::from(self.string_concat_buf.as_str()));
@@ -2443,8 +2635,8 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn sub_slow(&mut self, left: Value, right: Value) -> Result<Value, VMError> {
-        let a = self.to_number_val(left)?;
-        let b = self.to_number_val(right)?;
+        let a = self.coerce_to_number_val(left)?;
+        let b = self.coerce_to_number_val(right)?;
         let out = a - b;
         if out.is_finite() && out.fract() == 0.0 {
             Ok(Value::from_i64(out as i64))
@@ -2456,8 +2648,8 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn mul_slow(&mut self, left: Value, right: Value) -> Result<Value, VMError> {
-        let a = self.to_number_val(left)?;
-        let b = self.to_number_val(right)?;
+        let a = self.coerce_to_number_val(left)?;
+        let b = self.coerce_to_number_val(right)?;
         let out = a * b;
         if out.is_finite() && out.fract() == 0.0 {
             Ok(Value::from_i64(out as i64))
@@ -2469,16 +2661,16 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn div_slow(&mut self, left: Value, right: Value) -> Result<Value, VMError> {
-        let a = self.to_number_val(left)?;
-        let b = self.to_number_val(right)?;
+        let a = self.coerce_to_number_val(left)?;
+        let b = self.coerce_to_number_val(right)?;
         Ok(Value::from_f64(a / b))
     }
 
     #[cold]
     #[inline(never)]
     fn mod_slow(&mut self, left: Value, right: Value) -> Result<Value, VMError> {
-        let a = self.to_number_val(left)?;
-        let b = self.to_number_val(right)?;
+        let a = self.coerce_to_number_val(left)?;
+        let b = self.coerce_to_number_val(right)?;
         let out = a % b;
         if out.is_finite() && out.fract() == 0.0 {
             Ok(Value::from_i64(out as i64))
@@ -2487,9 +2679,43 @@ impl VM {
         }
     }
 
+    /// Coerce an Instance to a primitive via valueOf()/toString() for arithmetic.
+    /// For `+` operator which can result in either string concat or numeric add,
+    /// we need to return the coerced Value (not just f64).
+    fn coerce_instance_for_arithmetic(&mut self, val: Value) -> Result<Value, VMError> {
+        if val.is_heap() {
+            let heap_idx = val.heap_index() as usize;
+            let heap_obj = unsafe { &*self.heap.objects.as_ptr().add(heap_idx) };
+            if let Object::Instance(inst) = heap_obj {
+                // Try valueOf first (default hint for +)
+                if let Some(value_of_func) = inst.methods.get("valueOf").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        value_of_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    return Ok(result);
+                }
+                // Fall back to toString
+                if let Some(to_str_func) = inst.methods.get("toString").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        to_str_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    return Ok(result);
+                }
+            }
+        }
+        Ok(val)
+    }
+
     #[cold]
     #[inline(never)]
     fn comparison_slow(&mut self, op: ROp, left: Value, right: Value) -> Result<bool, VMError> {
+        // Coerce Instance objects via valueOf before comparison
+        let left = self.coerce_instance_for_arithmetic(left)?;
+        let right = self.coerce_instance_for_arithmetic(right)?;
         let lo = val_to_obj(left, &self.heap);
         let ro = val_to_obj(right, &self.heap);
         let result = self.eval_comparison(op, &lo, &ro)?;
@@ -2503,6 +2729,15 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn equality_slow(&mut self, left: Value, right: Value) -> bool {
+        // Coerce Instance objects via valueOf for loose equality
+        let left = match self.coerce_instance_for_arithmetic(left) {
+            Ok(v) => v,
+            Err(_) => left,
+        };
+        let right = match self.coerce_instance_for_arithmetic(right) {
+            Ok(v) => v,
+            Err(_) => right,
+        };
         let lo = val_as_obj_ref(left, &self.heap);
         let ro = val_as_obj_ref(right, &self.heap);
         self.equals(&lo, &ro)
@@ -2611,6 +2846,49 @@ impl VM {
         arg_start: usize,
     ) -> Result<Value, VMError> {
         let prop_sym = unsafe { *self.constants_syms_ptr.add(prop_idx) };
+
+        // Instance: look up method directly and call with the original heap
+        // reference as receiver so that `this` mutations persist in-place.
+        if obj_val.is_heap() {
+            let heap_idx = obj_val.heap_index() as usize;
+            let method_opt = match self.heap.objects.get(heap_idx) {
+                Some(Object::Instance(inst)) => {
+                    let prop_name = crate::intern::resolve(prop_sym);
+                    inst.methods.get(&*prop_name).cloned()
+                }
+                _ => None,
+            };
+            if let Some(method) = method_opt {
+                let arg_slice = unsafe {
+                    std::slice::from_raw_parts(self.stack.as_ptr().add(arg_start), nargs)
+                };
+                let (result, _) =
+                    self.execute_compiled_function_slice(method, arg_slice, Some(obj_val))?;
+                return Ok(result);
+            }
+        }
+
+        // Built-in methods on Hash objects (hasOwnProperty)
+        if prop_sym == self.sym_has_own_property && obj_val.is_heap() {
+            let heap_idx = obj_val.heap_index() as usize;
+            if let Some(Object::Hash(h)) = self.heap.objects.get(heap_idx) {
+                let key_val = if nargs >= 1 {
+                    unsafe { *self.stack.get_unchecked(arg_start) }
+                } else {
+                    Value::UNDEFINED
+                };
+                let key_str = {
+                    let obj = val_to_obj(key_val, &self.heap);
+                    match obj {
+                        Object::String(s) => s.to_string(),
+                        _ => obj.inspect(),
+                    }
+                };
+                let has = h.borrow().contains_str(&key_str);
+                return Ok(Value::from_bool(has));
+            }
+        }
+
         let callee_val = self.get_property_val(obj_val, prop_sym, cache_slot)?;
         let arg_slice =
             unsafe { std::slice::from_raw_parts(self.stack.as_ptr().add(arg_start), nargs) };

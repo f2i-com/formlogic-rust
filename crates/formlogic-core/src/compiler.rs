@@ -302,6 +302,11 @@ impl Compiler {
                     self.compile_statement(s)?;
                 }
             }
+            Statement::MultiLet(statements) => {
+                for s in statements {
+                    self.compile_statement(s)?;
+                }
+            }
             Statement::While { condition, body } => {
                 self.compile_while_statement(condition, body, None)?;
             }
@@ -345,6 +350,7 @@ impl Compiler {
                     body: body.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    is_arrow: false,
                 };
                 self.compile_expression(&function_expr)?;
 
@@ -1313,6 +1319,7 @@ impl Compiler {
                 }
                 // Recurse into blocks, loops, if-bodies, etc.
                 Statement::Block(body)
+                | Statement::MultiLet(body)
                 | Statement::While { body, .. }
                 | Statement::DoWhile { body, .. } => {
                     Self::collect_var_names(body, out);
@@ -1784,11 +1791,13 @@ impl Compiler {
                 body,
                 is_async,
                 is_generator,
+                is_arrow,
             } => {
+                let takes_this = !is_arrow;
                 let function_obj = self.compile_function_literal(
                     parameters,
                     body,
-                    true,
+                    takes_this,
                     *is_async,
                     *is_generator,
                 )?;
@@ -1810,6 +1819,14 @@ impl Compiler {
             Expression::Await { value } => {
                 self.compile_expression(value)?;
                 self.emit(Opcode::OpAwait, &[]);
+            }
+            Expression::Sequence(exprs) => {
+                for (i, expr) in exprs.iter().enumerate() {
+                    self.compile_expression(expr)?;
+                    if i < exprs.len() - 1 {
+                        self.emit(Opcode::OpPop, &[]);
+                    }
+                }
             }
             Expression::Yield { value, delegate: _ } => {
                 // Compile the value expression, then emit OpYield.
@@ -1834,7 +1851,37 @@ impl Compiler {
                 function,
                 arguments,
             } => {
-                if self.arguments_have_spread(arguments) {
+                // Optional method call: obj?.method(args)
+                if let Expression::OptionalIndex { left, index } = function.as_ref() {
+                    let temp_name = self.make_temp_name("optm");
+                    self.compile_expression(left)?;
+                    self.assign_identifier_from_top(&temp_name)?;
+
+                    self.compile_expression(&Expression::Identifier(temp_name.clone()))?;
+                    self.emit(Opcode::OpIsNullish, &[]);
+                    let nullish_pos = self.emit(Opcode::OpJumpNotTruthy, &[9999]);
+                    self.emit(Opcode::OpUndefined, &[]);
+                    let end_pos = self.emit(Opcode::OpJump, &[9999]);
+
+                    let call_pos = self.instructions.len();
+                    self.change_operand(nullish_pos, call_pos as u16);
+                    // Not nullish — do index access then call
+                    self.compile_expression(&Expression::Identifier(temp_name.clone()))?;
+                    self.compile_expression(index)?;
+                    self.emit(Opcode::OpIndex, &[]);
+                    if self.arguments_have_spread(arguments) {
+                        self.compile_arguments_array(arguments)?;
+                        self.emit(Opcode::OpCallSpread, &[]);
+                    } else {
+                        for arg in arguments {
+                            self.compile_expression(arg)?;
+                        }
+                        self.emit(Opcode::OpCall, &[arguments.len() as u16]);
+                    }
+
+                    let end = self.instructions.len();
+                    self.change_operand(end_pos, end as u16);
+                } else if self.arguments_have_spread(arguments) {
                     self.compile_expression(function)?;
                     self.compile_arguments_array(arguments)?;
                     self.emit(Opcode::OpCallSpread, &[]);
@@ -2337,6 +2384,10 @@ impl Compiler {
                 function: BuiltinFunction::DecodeURI,
                 receiver: None,
             }))),
+            "structuredClone" => Some(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                function: BuiltinFunction::StructuredClone,
+                receiver: None,
+            }))),
             "Infinity" => Some(Object::Float(f64::INFINITY)),
             "NaN" => Some(Object::Float(f64::NAN)),
             "undefined" => Some(Object::Undefined),
@@ -2350,6 +2401,20 @@ impl Compiler {
                     Self::hash_key_string("from"),
                     Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
                         function: BuiltinFunction::ArrayFrom,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("isArray"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ArrayIsArray,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("of"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ArrayOf,
                         receiver: None,
                     })),
                 );
@@ -2646,6 +2711,20 @@ impl Compiler {
                         receiver: None,
                     })),
                 );
+                array_ns.insert_pair_obj(
+                    Self::hash_key_string("isArray"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ArrayIsArray,
+                        receiver: None,
+                    })),
+                );
+                array_ns.insert_pair_obj(
+                    Self::hash_key_string("of"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ArrayOf,
+                        receiver: None,
+                    })),
+                );
                 hash.insert_pair_obj(Self::hash_key_string("Array"), make_hash(array_ns));
                 hash.insert_pair_obj(
                     Self::hash_key_string("RegExp"),
@@ -2753,6 +2832,13 @@ impl Compiler {
                         receiver: None,
                     })),
                 );
+                object_ns.insert_pair_obj(
+                    Self::hash_key_string("freeze"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ObjectFreeze,
+                        receiver: None,
+                    })),
+                );
                 hash.insert_pair_obj(Self::hash_key_string("Object"), make_hash(object_ns));
 
                 Some(make_hash(hash))
@@ -2808,8 +2894,26 @@ impl Compiler {
                         receiver: None,
                     })),
                 );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("freeze"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ObjectFreeze,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("create"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ObjectCreate,
+                        receiver: None,
+                    })),
+                );
                 Some(make_hash(hash))
             }
+            "Error" => Some(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                function: BuiltinFunction::ErrorConstructor,
+                receiver: None,
+            }))),
             "JSON" => {
                 let mut hash = HashObject::default();
                 hash.insert_pair_obj(
@@ -3350,7 +3454,17 @@ impl Compiler {
 
         fn_compiler.hoist_var_declarations(body)?;
 
+        // Hoist function declarations to top of function body (JS semantics)
+        for stmt in body.iter() {
+            if matches!(stmt, Statement::FunctionDecl { .. }) {
+                fn_compiler.compile_statement(stmt)?;
+            }
+        }
+
         for stmt in body {
+            if matches!(stmt, Statement::FunctionDecl { .. }) {
+                continue; // already compiled above
+            }
             fn_compiler.compile_statement(stmt)?;
         }
 
@@ -3389,6 +3503,8 @@ impl Compiler {
                 (0, 0);
                 fn_compiler.next_cache_slot as usize
             ])),
+            closure_captures: vec![],
+            captured_values: vec![],
         })
     }
 
@@ -3409,6 +3525,7 @@ impl Compiler {
             super_methods: FxHashMap::default(),
             super_getters: FxHashMap::default(),
             super_setters: FxHashMap::default(),
+            super_constructor_chain: vec![],
             field_initializers: vec![],
             static_initializers: vec![],
             static_fields: FxHashMap::default(),
@@ -3426,6 +3543,17 @@ impl Compiler {
                 }
                 class_obj.super_getters = parent.getters.clone();
                 class_obj.super_setters = parent.setters.clone();
+                // Build the constructor chain for multi-level super() calls.
+                if !parent.super_methods.is_empty() {
+                    class_obj.super_constructor_chain.push((
+                        parent.super_methods.clone(),
+                        parent.super_getters.clone(),
+                        parent.super_setters.clone(),
+                    ));
+                    class_obj
+                        .super_constructor_chain
+                        .extend(parent.super_constructor_chain.clone());
+                }
                 for (k, v) in &parent.methods {
                     class_obj.methods.entry(k.clone()).or_insert(v.clone());
                 }

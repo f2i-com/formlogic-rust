@@ -34,6 +34,9 @@ pub enum Statement {
     ReturnVoid,
     Expression(Expression),
     Block(Vec<Statement>),
+    /// Multiple let/const/var declarations from `let a = 1, b = 2;`.
+    /// Unlike Block, this does NOT introduce a new lexical scope.
+    MultiLet(Vec<Statement>),
     While {
         condition: Expression,
         body: Vec<Statement>,
@@ -236,6 +239,7 @@ pub enum Expression {
         body: Vec<Statement>,
         is_async: bool,
         is_generator: bool,
+        is_arrow: bool,
     },
     This,
     Super,
@@ -291,4 +295,6 @@ pub enum Expression {
         value: Box<Expression>,
         delegate: bool,
     },
+    /// Comma/sequence expression: `(a, b, c)` evaluates all, returns last.
+    Sequence(Vec<Expression>),
 }

@@ -248,6 +248,10 @@ pub struct VM {
     pub(crate) sym_get: u32,
     pub(crate) sym_has: u32,
     pub(crate) sym_size: u32,
+    pub(crate) sym_shift: u32,
+    pub(crate) sym_unshift: u32,
+    pub(crate) sym_splice: u32,
+    pub(crate) sym_has_own_property: u32,
     /// Fast path for `preconvert_constants`: remembers the last-used constants_raw
     /// key and its resolved pointers. Skips the linear cache scan when the same
     /// function is called repeatedly (e.g. `add()` called 1000× from a loop).
@@ -377,6 +381,10 @@ impl VM {
             sym_get: crate::intern::intern("get"),
             sym_has: crate::intern::intern("has"),
             sym_size: crate::intern::intern("size"),
+            sym_shift: crate::intern::intern("shift"),
+            sym_unshift: crate::intern::intern("unshift"),
+            sym_splice: crate::intern::intern("splice"),
+            sym_has_own_property: crate::intern::intern("hasOwnProperty"),
             last_preconvert_key: 0,
             last_preconvert_values_ptr: std::ptr::null(),
             last_preconvert_syms_ptr: std::ptr::null(),
@@ -470,6 +478,10 @@ impl VM {
             sym_get: crate::intern::intern("get"),
             sym_has: crate::intern::intern("has"),
             sym_size: crate::intern::intern("size"),
+            sym_shift: crate::intern::intern("shift"),
+            sym_unshift: crate::intern::intern("unshift"),
+            sym_splice: crate::intern::intern("splice"),
+            sym_has_own_property: crate::intern::intern("hasOwnProperty"),
             last_preconvert_key: 0,
             last_preconvert_values_ptr: std::ptr::null(),
             last_preconvert_syms_ptr: std::ptr::null(),
@@ -815,11 +827,11 @@ impl VM {
                             ))
                         };
                     } else {
+                        // Coerce Instance objects via valueOf/toString before add
+                        let left = self.coerce_instance_for_add(left)?;
+                        let right = self.coerce_instance_for_add(right)?;
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
-                        // Use buffered version — operands are owned (from val_to_obj),
-                        // so &mut self is safe. Reuses string_concat_buf to avoid
-                        // allocating a new String on every string concatenation.
                         let result = self.add_objects_buffered(lo, ro)?;
                         self.push_obj(result);
                     }
@@ -843,10 +855,14 @@ impl VM {
                             ))
                         };
                     } else {
-                        let lo = val_to_obj(left, &self.heap);
-                        let ro = val_to_obj(right, &self.heap);
-                        let result = self.sub_objects(&lo, &ro)?;
-                        self.push_obj(result);
+                        let a = self.coerce_to_number_val(left)?;
+                        let b = self.coerce_to_number_val(right)?;
+                        let out = a - b;
+                        if out.is_finite() && out.fract() == 0.0 {
+                            self.push_val(Value::from_i64(out as i64))?;
+                        } else {
+                            self.push_val(Value::from_f64(out))?;
+                        }
                     }
                     self.ip += 1;
                 }
@@ -868,10 +884,14 @@ impl VM {
                             ))
                         };
                     } else {
-                        let lo = val_to_obj(left, &self.heap);
-                        let ro = val_to_obj(right, &self.heap);
-                        let result = self.mul_objects(&lo, &ro)?;
-                        self.push_obj(result);
+                        let a = self.coerce_to_number_val(left)?;
+                        let b = self.coerce_to_number_val(right)?;
+                        let out = a * b;
+                        if out.is_finite() && out.fract() == 0.0 {
+                            self.push_val(Value::from_i64(out as i64))?;
+                        } else {
+                            self.push_val(Value::from_f64(out))?;
+                        }
                     }
                     self.ip += 1;
                 }
@@ -893,10 +913,9 @@ impl VM {
                             ))
                         };
                     } else {
-                        let lo = val_to_obj(left, &self.heap);
-                        let ro = val_to_obj(right, &self.heap);
-                        let result = self.div_objects(&lo, &ro)?;
-                        self.push_obj(result);
+                        let a = self.coerce_to_number_val(left)?;
+                        let b = self.coerce_to_number_val(right)?;
+                        self.push_val(Value::from_f64(a / b))?;
                     }
                     self.ip += 1;
                 }
@@ -918,10 +937,14 @@ impl VM {
                             ))
                         };
                     } else {
-                        let lo = val_to_obj(left, &self.heap);
-                        let ro = val_to_obj(right, &self.heap);
-                        let result = self.mod_objects(&lo, &ro)?;
-                        self.push_obj(result);
+                        let a = self.coerce_to_number_val(left)?;
+                        let b = self.coerce_to_number_val(right)?;
+                        let out = a % b;
+                        if out.is_finite() && out.fract() == 0.0 {
+                            self.push_val(Value::from_i64(out as i64))?;
+                        } else {
+                            self.push_val(Value::from_f64(out))?;
+                        }
                     }
                     self.ip += 1;
                 }
@@ -2108,6 +2131,7 @@ impl VM {
                                 methods: instance.super_methods.clone(),
                                 getters: instance.super_getters.clone(),
                                 setters: instance.super_setters.clone(),
+                                constructor_chain: instance.super_constructor_chain.clone(),
                             })))
                         };
                     } else {
@@ -2184,6 +2208,9 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() == right.to_number()
                     } else {
+                        // Coerce Instance objects via valueOf for loose equality
+                        let left = self.coerce_instance_for_add(left).unwrap_or(left);
+                        let right = self.coerce_instance_for_add(right).unwrap_or(right);
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         self.equals(&lo, &ro)
@@ -2218,6 +2245,8 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() != right.to_number()
                     } else {
+                        let left = self.coerce_instance_for_add(left).unwrap_or(left);
+                        let right = self.coerce_instance_for_add(right).unwrap_or(right);
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         !self.equals(&lo, &ro)
@@ -2250,6 +2279,8 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() > right.to_number()
                     } else {
+                        let left = self.coerce_instance_for_add(left)?;
+                        let right = self.coerce_instance_for_add(right)?;
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         self.compare_numeric(&lo, &ro, Opcode::OpGreaterThan)?
@@ -2265,6 +2296,8 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() < right.to_number()
                     } else {
+                        let left = self.coerce_instance_for_add(left)?;
+                        let right = self.coerce_instance_for_add(right)?;
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         self.compare_numeric(&lo, &ro, Opcode::OpLessThan)?
@@ -2280,6 +2313,8 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() <= right.to_number()
                     } else {
+                        let left = self.coerce_instance_for_add(left)?;
+                        let right = self.coerce_instance_for_add(right)?;
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         self.compare_numeric(&lo, &ro, Opcode::OpLessOrEqual)?
@@ -2295,6 +2330,8 @@ impl VM {
                     } else if left.is_number() && right.is_number() {
                         left.to_number() >= right.to_number()
                     } else {
+                        let left = self.coerce_instance_for_add(left)?;
+                        let right = self.coerce_instance_for_add(right)?;
                         let lo = val_to_obj(left, &self.heap);
                         let ro = val_to_obj(right, &self.heap);
                         self.compare_numeric(&lo, &ro, Opcode::OpGreaterOrEqual)?
@@ -2645,8 +2682,45 @@ impl VM {
                 }
                 return Ok(Value::UNDEFINED);
             }
+            // Instance: read fields/methods directly from the heap.
+            if matches!(heap_obj, Object::Instance(_)) {
+                let heap_idx = receiver_val.heap_index() as usize;
+                let prop_name = crate::intern::resolve(prop_sym);
+
+                // Check getter first
+                let getter = match &self.heap.objects[heap_idx] {
+                    Object::Instance(inst) => inst.getters.get(&*prop_name).cloned(),
+                    _ => None,
+                };
+                if let Some(getter_func) = getter {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        getter_func,
+                        &[],
+                        Some(receiver_val),
+                    )?;
+                    return Ok(result);
+                }
+
+                // Read field or method
+                return match &self.heap.objects[heap_idx] {
+                    Object::Instance(inst) => {
+                        if let Some(field_val) = inst.fields.get(&*prop_name) {
+                            Ok(obj_into_val(field_val.clone(), &mut self.heap))
+                        } else if let Some(method) = inst.methods.get(&*prop_name) {
+                            let func_val = obj_into_val(
+                                Object::CompiledFunction(Box::new(method.clone())),
+                                &mut self.heap,
+                            );
+                            self.maybe_bind_method_val(func_val, receiver_val)
+                        } else {
+                            Ok(Value::UNDEFINED)
+                        }
+                    }
+                    _ => Ok(Value::UNDEFINED),
+                };
+            }
         }
-        // Non-Hash fallback: use existing stack-based path
+        // Non-Hash/Instance fallback: use existing stack-based path
         let obj = val_to_obj(receiver_val, &self.heap);
         let index_obj = Object::String(crate::intern::resolve(prop_sym));
         self.execute_index_expression(obj, index_obj)?;
@@ -2693,6 +2767,10 @@ impl VM {
                 }
 
                 let hash = hash_rc.borrow_mut();
+                // Frozen check: silently ignore writes to frozen objects
+                if hash.frozen {
+                    return Ok(None);
+                }
                 // Inline cache hit
                 debug_assert!(cache_slot < self.inline_cache.len());
                 let (cached_shape, cached_offset) =
@@ -2710,8 +2788,43 @@ impl VM {
                 }
                 return Ok(None);
             }
+            // Instance: modify fields directly on the heap (in-place).
+            if matches!(heap_obj, Object::Instance(_)) {
+                let heap_idx = receiver_val.heap_index() as usize;
+                let prop_name = crate::intern::resolve(prop_sym);
+
+                // Check setter first
+                let setter = match &self.heap.objects[heap_idx] {
+                    Object::Instance(inst) => inst.setters.get(&*prop_name).cloned(),
+                    _ => None,
+                };
+                if let Some(setter_func) = setter {
+                    self.execute_compiled_function_slice(
+                        setter_func,
+                        std::slice::from_ref(&value),
+                        Some(receiver_val),
+                    )?;
+                    return Ok(None);
+                }
+
+                let val_obj = val_to_obj(value, &self.heap);
+                if let Object::Instance(inst) = &mut self.heap.objects[heap_idx] {
+                    inst.fields.insert(prop_name.to_string(), val_obj);
+                }
+                return Ok(None);
+            }
+            // Class: modify static fields directly on the heap (in-place).
+            if matches!(heap_obj, Object::Class(_)) {
+                let heap_idx = receiver_val.heap_index() as usize;
+                let prop_name = crate::intern::resolve(prop_sym);
+                let val_obj = val_to_obj(value, &self.heap);
+                if let Object::Class(class_obj) = &mut self.heap.objects[heap_idx] {
+                    class_obj.static_fields.insert(prop_name.to_string(), val_obj);
+                }
+                return Ok(None);
+            }
         }
-        // Non-Hash fallback
+        // Non-Hash/Instance/Class fallback
         let obj = val_to_obj(receiver_val, &self.heap);
         let val_obj = val_to_obj(value, &self.heap);
         self.execute_set_index(
@@ -2721,6 +2834,29 @@ impl VM {
         )?;
         let updated = self.pop_val()?;
         Ok(Some(updated))
+    }
+
+    /// Coerce a Value to its string representation for string concatenation.
+    /// For Instance objects, calls `toString()` if defined.
+    /// Returns the string, or falls back to `inspect()`.
+    pub(crate) fn coerce_to_string_val(&mut self, val: Value) -> Result<Rc<str>, VMError> {
+        if val.is_heap() {
+            let heap_idx = val.heap_index() as usize;
+            let heap_obj = unsafe { &*self.heap.objects.as_ptr().add(heap_idx) };
+            if let Object::Instance(inst) = heap_obj {
+                if let Some(to_str_func) = inst.methods.get("toString").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        to_str_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    let result_obj = val_to_obj(result, &self.heap);
+                    return Ok(Rc::from(result_obj.inspect()));
+                }
+                return Ok(Rc::from(format!("[Instance {}]", inst.class_name).as_str()));
+            }
+        }
+        Ok(Rc::from(val_to_obj(val, &self.heap).inspect().as_str()))
     }
 
     /// If `val` is a heap CompiledFunction, wrap it as a BoundMethod with
@@ -2976,7 +3112,13 @@ impl VM {
                             Cow::Owned(b.inspect())
                         }
                     }
-                    _ => Cow::Owned(b.inspect()),
+                    Object::Array(items) => {
+                        Cow::Owned(self.array_to_js_string(&items.borrow()))
+                    }
+                    Object::Hash(_) | Object::Instance(_) => {
+                        Cow::Borrowed("[object Object]")
+                    }
+                    _ => Cow::Owned(b.to_js_string()),
                 };
                 let mut s = String::with_capacity(a.len() + b_str.len());
                 s.push_str(a);
@@ -3003,7 +3145,13 @@ impl VM {
                             Cow::Owned(a.inspect())
                         }
                     }
-                    _ => Cow::Owned(a.inspect()),
+                    Object::Array(items) => {
+                        Cow::Owned(self.array_to_js_string(&items.borrow()))
+                    }
+                    Object::Hash(_) | Object::Instance(_) => {
+                        Cow::Borrowed("[object Object]")
+                    }
+                    _ => Cow::Owned(a.to_js_string()),
                 };
                 let mut s = String::with_capacity(a_str.len() + b.len());
                 s.push_str(&a_str);
@@ -3059,7 +3207,13 @@ impl VM {
                             self.string_concat_buf.push_str(&right.inspect());
                         }
                     }
-                    _ => self.string_concat_buf.push_str(&right.inspect()),
+                    Object::Array(items) => {
+                        self.string_concat_buf.push_str(&self.array_to_js_string(&items.borrow()));
+                    }
+                    Object::Hash(_) | Object::Instance(_) => {
+                        self.string_concat_buf.push_str("[object Object]");
+                    }
+                    _ => self.string_concat_buf.push_str(&right.to_js_string()),
                 };
                 if self.string_concat_buf.len() > MAX_STRING_LENGTH {
                     return Err(VMError::TypeError(
@@ -3084,7 +3238,13 @@ impl VM {
                             self.string_concat_buf.push_str(&left.inspect());
                         }
                     }
-                    _ => self.string_concat_buf.push_str(&left.inspect()),
+                    Object::Array(items) => {
+                        self.string_concat_buf.push_str(&self.array_to_js_string(&items.borrow()));
+                    }
+                    Object::Hash(_) | Object::Instance(_) => {
+                        self.string_concat_buf.push_str("[object Object]");
+                    }
+                    _ => self.string_concat_buf.push_str(&left.to_js_string()),
                 };
                 self.string_concat_buf.push_str(b);
                 if self.string_concat_buf.len() > MAX_STRING_LENGTH {
@@ -3096,58 +3256,6 @@ impl VM {
             }
             _ => self.add_objects(&left, &right),
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn sub_objects(&self, left: &Object, right: &Object) -> Result<Object, VMError> {
-        match (left, right) {
-            (Object::Integer(a), Object::Integer(b)) => Ok(Object::Integer(a - b)),
-            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - b)),
-            (Object::Integer(a), Object::Float(b)) => Ok(Object::Float(*a as f64 - b)),
-            (Object::Float(a), Object::Integer(b)) => Ok(Object::Float(a - *b as f64)),
-            (a, b) => {
-                let x = self.to_number(a)?;
-                let y = self.to_number(b)?;
-                let out = x - y;
-                if out.is_finite() && out.fract() == 0.0 {
-                    Ok(Object::Integer(out as i64))
-                } else {
-                    Ok(Object::Float(out))
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn mul_objects(&self, left: &Object, right: &Object) -> Result<Object, VMError> {
-        match (left, right) {
-            (Object::Integer(a), Object::Integer(b)) => Ok(Object::Integer(a * b)),
-            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a * b)),
-            (Object::Integer(a), Object::Float(b)) => Ok(Object::Float(*a as f64 * b)),
-            (Object::Float(a), Object::Integer(b)) => Ok(Object::Float(a * *b as f64)),
-            (a, b) => {
-                let x = self.to_number(a)?;
-                let y = self.to_number(b)?;
-                let out = x * y;
-                if out.is_finite() && out.fract() == 0.0 {
-                    Ok(Object::Integer(out as i64))
-                } else {
-                    Ok(Object::Float(out))
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn div_objects(&self, left: &Object, right: &Object) -> Result<Object, VMError> {
-        let (a, b) = match (left, right) {
-            (Object::Integer(a), Object::Integer(b)) => (*a as f64, *b as f64),
-            (Object::Float(a), Object::Float(b)) => (*a, *b),
-            (Object::Integer(a), Object::Float(b)) => (*a as f64, *b),
-            (Object::Float(a), Object::Integer(b)) => (*a, *b as f64),
-            (x, y) => (self.to_number(x)?, self.to_number(y)?),
-        };
-        Ok(Object::Float(a / b))
     }
 
     #[inline(always)]
@@ -3163,7 +3271,7 @@ impl VM {
     }
 
     #[inline(always)]
-    fn is_truthy(&self, value: &Object) -> bool {
+    pub(crate) fn is_truthy(&self, value: &Object) -> bool {
         match value {
             Object::Boolean(v) => *v,
             Object::Null | Object::Undefined => false,
@@ -3481,7 +3589,60 @@ impl VM {
         self.to_number(&val_to_obj(val, &self.heap))
     }
 
-    fn to_i32_val(&self, val: Value) -> Result<i32, VMError> {
+    /// Like to_number_val but calls valueOf() on Instance objects if available.
+    pub(crate) fn coerce_to_number_val(&mut self, val: Value) -> Result<f64, VMError> {
+        if val.is_i32() {
+            return Ok(unsafe { val.as_i32_unchecked() } as f64);
+        }
+        if val.is_f64() {
+            return Ok(val.as_f64());
+        }
+        if val.is_heap() {
+            let heap_idx = val.heap_index() as usize;
+            let heap_obj = unsafe { &*self.heap.objects.as_ptr().add(heap_idx) };
+            if let Object::Instance(inst) = heap_obj {
+                if let Some(value_of_func) = inst.methods.get("valueOf").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        value_of_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    return self.to_number_val(result);
+                }
+            }
+        }
+        self.to_number(&val_to_obj(val, &self.heap))
+    }
+
+    /// Coerce an Instance to a primitive via valueOf()/toString() for the + operator.
+    /// Returns the coerced Value (which may be a number or string).
+    fn coerce_instance_for_add(&mut self, val: Value) -> Result<Value, VMError> {
+        if val.is_heap() {
+            let heap_idx = val.heap_index() as usize;
+            let heap_obj = unsafe { &*self.heap.objects.as_ptr().add(heap_idx) };
+            if let Object::Instance(inst) = heap_obj {
+                if let Some(value_of_func) = inst.methods.get("valueOf").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        value_of_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    return Ok(result);
+                }
+                if let Some(to_str_func) = inst.methods.get("toString").cloned() {
+                    let (result, _) = self.execute_compiled_function_slice(
+                        to_str_func,
+                        &[],
+                        Some(val),
+                    )?;
+                    return Ok(result);
+                }
+            }
+        }
+        Ok(val)
+    }
+
+    pub(crate) fn to_i32_val(&self, val: Value) -> Result<i32, VMError> {
         if val.is_i32() {
             return Ok(unsafe { val.as_i32_unchecked() });
         }
@@ -4059,6 +4220,7 @@ impl VM {
                         "sort" => Some(BuiltinFunction::ArraySort),
                         "filter" => Some(BuiltinFunction::ArrayFilter),
                         "reduce" => Some(BuiltinFunction::ArrayReduce),
+                        "reduceRight" => Some(BuiltinFunction::ArrayReduceRight),
                         "find" => Some(BuiltinFunction::ArrayFind),
                         "includes" => Some(BuiltinFunction::ArrayIncludes),
                         "join" => Some(BuiltinFunction::ArrayJoin),
@@ -4071,6 +4233,15 @@ impl VM {
                         "keys" => Some(BuiltinFunction::ArrayKeys),
                         "values" => Some(BuiltinFunction::ArrayValues),
                         "entries" => Some(BuiltinFunction::ArrayEntries),
+                        "shift" => Some(BuiltinFunction::ArrayShift),
+                        "unshift" => Some(BuiltinFunction::ArrayUnshift),
+                        "splice" => Some(BuiltinFunction::ArraySplice),
+                        "concat" => Some(BuiltinFunction::ArrayConcat),
+                        "fill" => Some(BuiltinFunction::ArrayFill),
+                        "copyWithin" => Some(BuiltinFunction::ArrayCopyWithin),
+                        "findLast" => Some(BuiltinFunction::ArrayFindLast),
+                        "findLastIndex" => Some(BuiltinFunction::ArrayFindLastIndex),
+                        "toReversed" => Some(BuiltinFunction::ArrayToReversed),
                         _ => None,
                     };
                     if let Some(function) = builtin {
@@ -4140,7 +4311,19 @@ impl VM {
                             self.push(obj)?;
                         }
                     }
-                    None => self.push(Object::Undefined)?,
+                    None => {
+                        // Built-in methods on hash/object literals
+                        if let Object::String(s) = &index {
+                            if &**s == "hasOwnProperty" {
+                                self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                    function: BuiltinFunction::HashHasOwnProperty,
+                                    receiver: Some(Object::Hash(Rc::clone(&hash))),
+                                })))?;
+                                return Ok(());
+                            }
+                        }
+                        self.push(Object::Undefined)?;
+                    }
                 }
                 Ok(())
             }
@@ -4186,6 +4369,27 @@ impl VM {
                 }
 
                 self.push(undefined_object())?;
+                Ok(())
+            }
+            Object::Error(err) => {
+                if let Object::String(s) = &index {
+                    match &**s {
+                        "message" => {
+                            self.push(Object::String(err.message.clone()))?;
+                        }
+                        "name" => {
+                            self.push(Object::String(err.name.clone()))?;
+                        }
+                        "stack" => {
+                            self.push(Object::String(Rc::from("")))?;
+                        }
+                        _ => {
+                            self.push(undefined_object())?;
+                        }
+                    }
+                } else {
+                    self.push(undefined_object())?;
+                }
                 Ok(())
             }
             Object::Class(class_obj) => {
@@ -4244,8 +4448,30 @@ impl VM {
                     }
                 };
 
+                // Helper: shift the receiver's super_methods to the next
+                // ancestor level so that super.X() inside the parent method
+                // correctly resolves to the grandparent's methods.
+                let shift_receiver = |recv: &Object, chain: &[crate::object::SuperLevel]| -> Object {
+                    let mut r = recv.clone();
+                    if let Object::Instance(inst) = &mut r {
+                        if let Some((next_m, next_g, next_s)) = chain.first() {
+                            inst.super_methods = next_m.clone();
+                            inst.super_getters = next_g.clone();
+                            inst.super_setters = next_s.clone();
+                            inst.super_constructor_chain = chain[1..].to_vec();
+                        } else {
+                            inst.super_methods.clear();
+                            inst.super_getters.clear();
+                            inst.super_setters.clear();
+                            inst.super_constructor_chain.clear();
+                        }
+                    }
+                    r
+                };
+
                 if let Some(getter) = super_ref.getters.get(prop.as_ref()) {
-                    let receiver_val = obj_into_val((*super_ref.receiver).clone(), &mut self.heap);
+                    let shifted = shift_receiver(&super_ref.receiver, &super_ref.constructor_chain);
+                    let receiver_val = obj_into_val(shifted, &mut self.heap);
                     let (result, _) = self.execute_compiled_function_slice(
                         getter.clone(),
                         &[],
@@ -4256,10 +4482,11 @@ impl VM {
                 }
 
                 if let Some(method) = super_ref.methods.get(prop.as_ref()) {
+                    let shifted = shift_receiver(&super_ref.receiver, &super_ref.constructor_chain);
                     self.push(Object::BoundMethod(Box::new(
                         crate::object::BoundMethodObject {
                             function: method.clone(),
-                            receiver: super_ref.receiver.clone(),
+                            receiver: Box::new(shifted),
                         },
                     )))?;
                     return Ok(());
@@ -4394,6 +4621,48 @@ impl VM {
                                 receiver: Some(Object::String(text)),
                             })))?;
                         }
+                        "search" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringSearch,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "concat" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringConcat,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "trimStart" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringTrimStart,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "trimEnd" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringTrimEnd,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "at" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringAt,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "codePointAt" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringCodePointAt,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
+                        "normalize" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringNormalize,
+                                receiver: Some(Object::String(text)),
+                            })))?;
+                        }
                         _ => {
                             self.push(undefined_object())?;
                         }
@@ -4423,6 +4692,12 @@ impl VM {
                             receiver: Some(Object::Integer(v)),
                         })))?
                     }
+                    "toPrecision" => {
+                        self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                            function: BuiltinFunction::NumberToPrecision,
+                            receiver: Some(Object::Integer(v)),
+                        })))?
+                    }
                     "toString" => {
                         self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
                             function: BuiltinFunction::NumberToString,
@@ -4442,6 +4717,12 @@ impl VM {
                             receiver: Some(Object::Float(v)),
                         })))?
                     }
+                    "toPrecision" => {
+                        self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                            function: BuiltinFunction::NumberToPrecision,
+                            receiver: Some(Object::Float(v)),
+                        })))?
+                    }
                     "toString" => {
                         self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
                             function: BuiltinFunction::NumberToString,
@@ -4455,12 +4736,27 @@ impl VM {
             Object::BuiltinFunction(builtin) => {
                 let key = self.object_key_cow(&index);
                 match builtin.function {
-                    BuiltinFunction::StringCtor if key.as_ref() == "fromCharCode" => {
-                        self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
-                            function: BuiltinFunction::StringFromCharCode,
-                            receiver: None,
-                        })))?;
-                    }
+                    BuiltinFunction::StringCtor => match key.as_ref() {
+                        "fromCharCode" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringFromCharCode,
+                                receiver: None,
+                            })))?;
+                        }
+                        "fromCodePoint" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringFromCodePoint,
+                                receiver: None,
+                            })))?;
+                        }
+                        "raw" => {
+                            self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                                function: BuiltinFunction::StringRaw,
+                                receiver: None,
+                            })))?;
+                        }
+                        _ => self.push(undefined_object())?,
+                    },
                     BuiltinFunction::NumberCtor => match key.as_ref() {
                         "isNaN" => {
                             self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
@@ -4517,6 +4813,12 @@ impl VM {
                     "test" => {
                         self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
                             function: BuiltinFunction::RegExpTest,
+                            receiver: Some(Object::RegExp(re)),
+                        })))?
+                    }
+                    "exec" => {
+                        self.push(Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                            function: BuiltinFunction::RegExpExec,
                             receiver: Some(Object::RegExp(re)),
                         })))?
                     }
@@ -4783,15 +5085,68 @@ impl VM {
             }
             Object::SuperRef(super_ref) => {
                 let SuperRefObject {
-                    receiver,
+                    mut receiver,
                     mut methods,
+                    constructor_chain,
                     ..
                 } = *super_ref;
                 if let Some(ctor) = methods.remove("constructor") {
+                    // Save original super info so we can restore after the parent
+                    // constructor returns (needed for super.method() calls later).
+                    let (saved_sm, saved_sg, saved_ss, saved_chain) =
+                        if let Object::Instance(inst) = &*receiver {
+                            (
+                                inst.super_methods.clone(),
+                                inst.super_getters.clone(),
+                                inst.super_setters.clone(),
+                                inst.super_constructor_chain.clone(),
+                            )
+                        } else {
+                            (
+                                rustc_hash::FxHashMap::default(),
+                                rustc_hash::FxHashMap::default(),
+                                rustc_hash::FxHashMap::default(),
+                                vec![],
+                            )
+                        };
+
+                    // Shift the super chain so that nested super() calls inside
+                    // the parent constructor resolve to the next ancestor.
+                    if let Object::Instance(inst) = &mut *receiver {
+                        if let Some((next_methods, next_getters, next_setters)) =
+                            constructor_chain.first()
+                        {
+                            inst.super_methods = next_methods.clone();
+                            inst.super_getters = next_getters.clone();
+                            inst.super_setters = next_setters.clone();
+                            inst.super_constructor_chain =
+                                constructor_chain[1..].to_vec();
+                        } else {
+                            inst.super_methods.clear();
+                            inst.super_getters.clear();
+                            inst.super_setters.clear();
+                            inst.super_constructor_chain.clear();
+                        }
+                    }
                     let receiver_val = obj_into_val(*receiver, &mut self.heap);
                     let (result, receiver_after) =
                         self.execute_compiled_function_slice(ctor, args, Some(receiver_val))?;
-                    Ok(receiver_after.unwrap_or(result))
+
+                    // Restore original super info on the returned instance so that
+                    // super.method() calls in the derived class work correctly.
+                    let final_val = receiver_after.unwrap_or(result);
+                    if final_val.is_heap() {
+                        let heap_idx = final_val.heap_index() as usize;
+                        if let Some(Object::Instance(inst)) =
+                            self.heap.objects.get_mut(heap_idx)
+                        {
+                            inst.super_methods = saved_sm;
+                            inst.super_getters = saved_sg;
+                            inst.super_setters = saved_ss;
+                            inst.super_constructor_chain = saved_chain;
+                        }
+                    }
+                    Ok(final_val)
                 } else {
                     Err(VMError::TypeError(
                         "super constructor not found".to_string(),
@@ -5000,7 +5355,14 @@ impl VM {
                     .map(|v| self.to_number_val(*v))
                     .transpose()?
                     .unwrap_or(f64::NAN);
-                let out = if n.is_nan() { f64::NAN } else { n.signum() };
+                let out = if n.is_nan() {
+                    f64::NAN
+                } else if n == 0.0 {
+                    // JS Math.sign(0) === 0, Math.sign(-0) === -0
+                    n
+                } else {
+                    n.signum()
+                };
                 if out.is_finite() && out.fract() == 0.0 {
                     Ok(Value::from_i64(out as i64))
                 } else {
@@ -5265,35 +5627,62 @@ impl VM {
                     Object::String(s) => s,
                     _ => return Ok(Value::UNDEFINED),
                 };
-                let sep = args
-                    .first()
-                    .map(|v| val_inspect(*v, &self.heap))
-                    .unwrap_or_else(String::new);
-                if sep.is_empty() {
-                    return Ok(obj_into_val(
-                        make_array(
-                            text.chars()
-                                .map(|c| {
-                                    obj_into_val(
-                                        Object::String(c.to_string().into()),
-                                        &mut self.heap,
-                                    )
-                                })
-                                .collect(),
-                        ),
-                        &mut self.heap,
-                    ));
+                let limit: Option<usize> = if args.len() >= 2 {
+                    Some(self.to_i32_val(args[1])?.max(0) as usize)
+                } else {
+                    None
+                };
+
+                // Check if separator is a RegExp
+                let sep_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let sep_obj = val_to_obj(sep_val, &self.heap);
+                if let Object::RegExp(re) = &sep_obj {
+                    let regex = self.build_regex(&re.pattern, &re.flags)?;
+                    let mut items: Vec<Value> = Vec::new();
+                    let mut last = 0;
+                    let max = limit.unwrap_or(usize::MAX);
+                    for m in regex.find_iter(&text) {
+                        if items.len() >= max { break; }
+                        items.push(obj_into_val(
+                            Object::String(text[last..m.start()].to_string().into()),
+                            &mut self.heap,
+                        ));
+                        last = m.end();
+                    }
+                    if items.len() < max {
+                        items.push(obj_into_val(
+                            Object::String(text[last..].to_string().into()),
+                            &mut self.heap,
+                        ));
+                    }
+                    return Ok(obj_into_val(make_array(items), &mut self.heap));
                 }
-                Ok(obj_into_val(
-                    make_array(
-                        text.split(&sep)
-                            .map(|s| {
-                                obj_into_val(Object::String(s.to_string().into()), &mut self.heap)
-                            })
-                            .collect(),
-                    ),
-                    &mut self.heap,
-                ))
+
+                let sep = match sep_obj {
+                    Object::String(s) => s.to_string(),
+                    _ => sep_obj.inspect(),
+                };
+                if sep.is_empty() {
+                    let items: Vec<Value> = text
+                        .chars()
+                        .take(limit.unwrap_or(usize::MAX))
+                        .map(|c| {
+                            obj_into_val(
+                                Object::String(c.to_string().into()),
+                                &mut self.heap,
+                            )
+                        })
+                        .collect();
+                    return Ok(obj_into_val(make_array(items), &mut self.heap));
+                }
+                let items: Vec<Value> = text
+                    .split(&sep)
+                    .take(limit.unwrap_or(usize::MAX))
+                    .map(|s| {
+                        obj_into_val(Object::String(s.to_string().into()), &mut self.heap)
+                    })
+                    .collect();
+                Ok(obj_into_val(make_array(items), &mut self.heap))
             }
             BuiltinFunction::StringIncludes => {
                 let receiver = builtin.receiver.ok_or_else(|| {
@@ -6240,30 +6629,24 @@ impl VM {
                     return Ok(Value::UNDEFINED);
                 }
 
-                let arg0 = val_to_obj(args[0], &self.heap);
-                let mut target = match &arg0 {
-                    Object::Hash(h) => {
-                        let h = h.borrow_mut();
-                        h.sync_pairs_if_dirty();
-                        h.clone()
-                    }
-                    _ => crate::object::HashObject::default(),
-                };
+                let target_val = args[0];
 
+                // Collect source entries first (avoids borrow conflicts)
+                let mut source_entries: Vec<Vec<(HashKey, Value)>> = Vec::new();
                 for source_val in args.iter().skip(1) {
                     let source = val_to_obj(*source_val, &self.heap);
+                    let mut entries = Vec::new();
                     match &source {
                         Object::Hash(hash) => {
                             let hash_b = hash.borrow_mut();
                             hash_b.sync_pairs_if_dirty();
-                            for k in hash_b.ordered_keys_ref() {
-                                let v = hash_b.pairs.get(&k).expect("hash key_order out of sync");
-                                target.insert_pair(k.clone(), v.clone());
+                            for (k, v) in hash_b.pairs.iter() {
+                                entries.push((k.clone(), *v));
                             }
                         }
                         Object::Array(items) => {
                             for (i, v) in items.borrow().iter().enumerate() {
-                                target.insert_pair(HashKey::from_string(&i.to_string()), *v);
+                                entries.push((HashKey::from_string(&i.to_string()), *v));
                             }
                         }
                         Object::String(s) => {
@@ -6272,14 +6655,106 @@ impl VM {
                                     Object::String(ch.to_string().into()),
                                     &mut self.heap,
                                 );
-                                target.insert_pair(HashKey::from_string(&i.to_string()), val);
+                                entries.push((HashKey::from_string(&i.to_string()), val));
                             }
                         }
                         _ => {}
                     }
+                    source_entries.push(entries);
                 }
 
+                // Mutate target in-place (or create new if not a hash)
+                if target_val.is_heap() {
+                    let heap_obj = unsafe {
+                        &*self
+                            .heap
+                            .objects
+                            .as_ptr()
+                            .add(target_val.heap_index() as usize)
+                    };
+                    if let Object::Hash(hash_rc) = heap_obj {
+                        let target = hash_rc.borrow_mut();
+                        for entries in source_entries {
+                            for (k, v) in entries {
+                                target.insert_pair(k, v);
+                            }
+                        }
+                        return Ok(target_val);
+                    }
+                }
+
+                // Fallback: create new hash
+                let mut target = crate::object::HashObject::default();
+                for entries in source_entries {
+                    for (k, v) in entries {
+                        target.insert_pair(k, v);
+                    }
+                }
                 Ok(obj_into_val(make_hash(target), &mut self.heap))
+            }
+            BuiltinFunction::ObjectFreeze => {
+                let target_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if target_val.is_heap() {
+                    let heap_obj = unsafe {
+                        &*self
+                            .heap
+                            .objects
+                            .as_ptr()
+                            .add(target_val.heap_index() as usize)
+                    };
+                    if let Object::Hash(hash_rc) = heap_obj {
+                        hash_rc.borrow_mut().frozen = true;
+                    }
+                }
+                Ok(target_val)
+            }
+            BuiltinFunction::ObjectCreate => {
+                let proto_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if proto_val.is_null() {
+                    return Ok(obj_into_val(make_hash(HashObject::default()), &mut self.heap));
+                }
+                if proto_val.is_heap() {
+                    let heap_idx = proto_val.heap_index() as usize;
+                    let proto_obj = unsafe { &*self.heap.objects.as_ptr().add(heap_idx) };
+                    if let Object::Hash(h) = proto_obj {
+                        let mut new_hash = HashObject::default();
+                        let h = h.borrow();
+                        for (key, &val) in h.pairs.iter() {
+                            new_hash.pairs.insert(key.clone(), val);
+                        }
+                        new_hash.values = h.values.clone();
+                        new_hash.str_slots = h.str_slots.clone();
+                        if let Some(ref getters) = h.getters {
+                            new_hash.getters = Some(getters.clone());
+                        }
+                        if let Some(ref setters) = h.setters {
+                            new_hash.setters = Some(setters.clone());
+                        }
+                        return Ok(obj_into_val(make_hash(new_hash), &mut self.heap));
+                    }
+                }
+                Ok(obj_into_val(make_hash(HashObject::default()), &mut self.heap))
+            }
+            BuiltinFunction::ArrayOf => {
+                Ok(obj_into_val(make_array(args.to_vec()), &mut self.heap))
+            }
+            BuiltinFunction::HashHasOwnProperty => {
+                let key_str = args
+                    .first()
+                    .map(|v| {
+                        let obj = val_to_obj(*v, &self.heap);
+                        match obj {
+                            Object::String(s) => s.to_string(),
+                            _ => obj.inspect(),
+                        }
+                    })
+                    .unwrap_or_default();
+                if let Some(Object::Hash(h)) = &builtin.receiver {
+                    let has = h.borrow().contains_str(&key_str);
+                    Ok(Value::from_bool(has))
+                } else {
+                    Ok(Value::FALSE)
+                }
             }
             BuiltinFunction::JsonStringify => {
                 let value = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -6698,6 +7173,58 @@ impl VM {
                 }
                 Ok(Value::from_i64(-1))
             }
+            BuiltinFunction::ArrayFindLast => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.findLast missing receiver".to_string())
+                })?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let callback = args.first().copied().ok_or_else(|| {
+                    VMError::TypeError("Array.findLast requires callback".to_string())
+                })?;
+                for i in (0..items.len()).rev() {
+                    let item = items[i];
+                    let found = self.call_value2(callback, item, Value::from_i64(i as i64))?;
+                    if self.is_truthy(&val_to_obj(found, &self.heap)) {
+                        return Ok(item);
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
+            BuiltinFunction::ArrayFindLastIndex => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.findLastIndex missing receiver".to_string())
+                })?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::from_i64(-1)),
+                };
+                let callback = args.first().copied().ok_or_else(|| {
+                    VMError::TypeError("Array.findLastIndex requires callback".to_string())
+                })?;
+                for i in (0..items.len()).rev() {
+                    let item = items[i];
+                    let found = self.call_value2(callback, item, Value::from_i64(i as i64))?;
+                    if self.is_truthy(&val_to_obj(found, &self.heap)) {
+                        return Ok(Value::from_i64(i as i64));
+                    }
+                }
+                Ok(Value::from_i64(-1))
+            }
+            BuiltinFunction::ArrayToReversed => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.toReversed missing receiver".to_string())
+                })?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let mut reversed = items;
+                reversed.reverse();
+                Ok(obj_into_val(make_array(reversed), &mut self.heap))
+            }
             BuiltinFunction::ArrayIncludes => {
                 let receiver = builtin.receiver.ok_or_else(|| {
                     VMError::TypeError("Array.includes missing receiver".to_string())
@@ -6788,6 +7315,10 @@ impl VM {
                         let obj = val_to_obj(*v, &self.heap);
                         match &obj {
                             Object::Undefined | Object::Null => String::new(),
+                            Object::Array(nested) => {
+                                self.array_to_js_string(&nested.borrow())
+                            }
+                            Object::Hash(_) => "[object Object]".to_string(),
                             _ => obj.inspect(),
                         }
                     })
@@ -6892,6 +7423,44 @@ impl VM {
 
                 Ok(acc)
             }
+            BuiltinFunction::ArrayReduceRight => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.reduceRight missing receiver".to_string())
+                })?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let callback = args.first().copied().ok_or_else(|| {
+                    VMError::TypeError("Array.reduceRight requires callback".to_string())
+                })?;
+
+                if items.is_empty() && args.get(1).is_none() {
+                    return Err(VMError::TypeError(
+                        "Reduce of empty array with no initial value".to_string(),
+                    ));
+                }
+
+                let len = items.len();
+                let mut idx = len.wrapping_sub(1);
+                let mut acc: Value = if let Some(init) = args.get(1) {
+                    *init
+                } else {
+                    idx = len.wrapping_sub(2);
+                    items[len - 1]
+                };
+
+                loop {
+                    if idx >= len {
+                        break;
+                    }
+                    acc =
+                        self.call_value3(callback, acc, items[idx], Value::from_i64(idx as i64))?;
+                    idx = idx.wrapping_sub(1);
+                }
+
+                Ok(acc)
+            }
             BuiltinFunction::ArrayFrom => {
                 let source_val = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let source = val_to_obj(source_val, &self.heap);
@@ -6942,6 +7511,34 @@ impl VM {
                             make_array(vec![key_val, *v])
                         })
                         .collect(),
+                    Object::Generator(gen_rc) => {
+                        // Iterate generator by calling .next() until done
+                        let mut items = Vec::new();
+                        loop {
+                            let result = self.execute_generator_next(&gen_rc, Value::UNDEFINED)?;
+                            let result_obj = val_to_obj(result, &self.heap);
+                            match result_obj {
+                                Object::Hash(h) => {
+                                    let hb = h.borrow();
+                                    let done = hb.get_by_str("done")
+                                        .map(|v| {
+                                            let obj = val_to_obj(v, &self.heap);
+                                            self.is_truthy(&obj)
+                                        })
+                                        .unwrap_or(false);
+                                    if done {
+                                        break;
+                                    }
+                                    let value = hb.get_by_str("value")
+                                        .map(|v| val_to_obj(v, &self.heap))
+                                        .unwrap_or_else(undefined_object);
+                                    items.push(value);
+                                }
+                                _ => break,
+                            }
+                        }
+                        items
+                    }
                     _ => vec![],
                 };
 
@@ -6965,6 +7562,85 @@ impl VM {
                     .map(|o| obj_into_val(o, &mut self.heap))
                     .collect();
                 Ok(obj_into_val(make_array(result), &mut self.heap))
+            }
+            BuiltinFunction::ArrayIsArray => {
+                let val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let is_arr = if val.is_heap() {
+                    matches!(
+                        self.heap.objects.get(val.heap_index() as usize),
+                        Some(Object::Array(_))
+                    )
+                } else {
+                    false
+                };
+                Ok(Value::from_bool(is_arr))
+            }
+            BuiltinFunction::ArrayFill => {
+                let receiver = builtin
+                    .receiver
+                    .ok_or_else(|| VMError::TypeError("fill requires receiver".to_string()))?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Err(VMError::TypeError("fill called on non-array".to_string())),
+                };
+                let fill_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let len = items.len() as i64;
+                let start = if let Some(v) = args.get(1) {
+                    let s = self.to_i32_val(*v)? as i64;
+                    if s < 0 { (len + s).max(0) as usize } else { (s as usize).min(len as usize) }
+                } else {
+                    0
+                };
+                let end = if let Some(v) = args.get(2) {
+                    let e = self.to_i32_val(*v)? as i64;
+                    if e < 0 { (len + e).max(0) as usize } else { (e as usize).min(len as usize) }
+                } else {
+                    len as usize
+                };
+                let mut new_items = items;
+                for i in start..end {
+                    new_items[i] = fill_val;
+                }
+                Ok(obj_into_val(make_array(new_items), &mut self.heap))
+            }
+            BuiltinFunction::ArrayCopyWithin => {
+                let receiver = builtin
+                    .receiver
+                    .ok_or_else(|| VMError::TypeError("copyWithin requires receiver".to_string()))?;
+                let items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => {
+                        return Err(VMError::TypeError(
+                            "copyWithin called on non-array".to_string(),
+                        ))
+                    }
+                };
+                let len = items.len() as i64;
+                let target = {
+                    let t = self.to_i32_val(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
+                    if t < 0 { (len + t).max(0) as usize } else { (t as usize).min(len as usize) }
+                };
+                let start = if let Some(v) = args.get(1) {
+                    let s = self.to_i32_val(*v)? as i64;
+                    if s < 0 { (len + s).max(0) as usize } else { (s as usize).min(len as usize) }
+                } else {
+                    0
+                };
+                let end = if let Some(v) = args.get(2) {
+                    let e = self.to_i32_val(*v)? as i64;
+                    if e < 0 { (len + e).max(0) as usize } else { (e as usize).min(len as usize) }
+                } else {
+                    len as usize
+                };
+                // Copy elements from [start..end) to [target..)
+                let count = (end - start).min(len as usize - target);
+                let mut new_items = items;
+                // Use a temporary buffer to handle overlapping regions
+                let source: Vec<Value> = new_items[start..start + count].to_vec();
+                for (i, val) in source.into_iter().enumerate() {
+                    new_items[target + i] = val;
+                }
+                Ok(obj_into_val(make_array(new_items), &mut self.heap))
             }
             BuiltinFunction::ArrayKeys => {
                 let receiver = builtin
@@ -7007,6 +7683,86 @@ impl VM {
                     .collect();
                 Ok(obj_into_val(make_array(out), &mut self.heap))
             }
+            BuiltinFunction::ArrayShift => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.shift missing receiver".to_string())
+                })?;
+                let mut items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                if items.is_empty() {
+                    Ok(Value::UNDEFINED)
+                } else {
+                    let first = items.remove(0);
+                    Ok(first)
+                }
+            }
+            BuiltinFunction::ArrayUnshift => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.unshift missing receiver".to_string())
+                })?;
+                let mut items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                for (i, arg) in args.iter().enumerate() {
+                    items.insert(i, *arg);
+                }
+                if items.len() > MAX_ARRAY_SIZE {
+                    return Err(VMError::TypeError("Array size limit exceeded".to_string()));
+                }
+                Ok(Value::from_i64(items.len() as i64))
+            }
+            BuiltinFunction::ArraySplice => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.splice missing receiver".to_string())
+                })?;
+                let mut items = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let len = items.len() as i64;
+                let start_raw = args
+                    .first()
+                    .map(|v| self.to_i32_val(*v))
+                    .transpose()?
+                    .unwrap_or(0) as i64;
+                let start = if start_raw < 0 {
+                    (len + start_raw).max(0) as usize
+                } else {
+                    (start_raw as usize).min(items.len())
+                };
+                let delete_count = if args.len() >= 2 {
+                    self.to_i32_val(args[1])?.max(0) as usize
+                } else {
+                    items.len() - start
+                };
+                let delete_count = delete_count.min(items.len() - start);
+                let removed: Vec<Value> = items.drain(start..start + delete_count).collect();
+                // Insert new items
+                for (i, arg) in args[2..].iter().enumerate() {
+                    items.insert(start + i, *arg);
+                }
+                Ok(obj_into_val(make_array(removed), &mut self.heap))
+            }
+            BuiltinFunction::ArrayConcat => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Array.concat missing receiver".to_string())
+                })?;
+                let mut result = match receiver {
+                    Object::Array(items) => unwrap_array(items),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                for arg in args {
+                    let obj = val_to_obj(*arg, &self.heap);
+                    match obj {
+                        Object::Array(items) => result.extend(unwrap_array(items)),
+                        _ => result.push(*arg),
+                    }
+                }
+                Ok(obj_into_val(make_array(result), &mut self.heap))
+            }
             BuiltinFunction::RegExpCtor => {
                 let arg0 = args.first().map(|v| val_to_obj(*v, &self.heap));
                 let (pattern, inferred_flags) = match arg0.as_ref() {
@@ -7036,6 +7792,36 @@ impl VM {
                     .unwrap_or_else(String::new);
                 let regex = self.build_regex(&re.pattern, &re.flags)?;
                 Ok(Value::from_bool(regex.is_match(&text)))
+            }
+            BuiltinFunction::RegExpExec => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("RegExp.exec missing receiver".to_string())
+                })?;
+                let re = match receiver {
+                    Object::RegExp(re) => *re,
+                    _ => return Ok(Value::NULL),
+                };
+                let text = args
+                    .first()
+                    .map(|v| val_inspect(*v, &self.heap))
+                    .unwrap_or_else(String::new);
+                let regex = self.build_regex(&re.pattern, &re.flags)?;
+                if let Some(captures) = regex.captures(&text) {
+                    let mut result = Vec::new();
+                    for i in 0..captures.len() {
+                        if let Some(m) = captures.get(i) {
+                            result.push(obj_into_val(
+                                Object::String(m.as_str().to_string().into()),
+                                &mut self.heap,
+                            ));
+                        } else {
+                            result.push(Value::UNDEFINED);
+                        }
+                    }
+                    Ok(obj_into_val(make_array(result), &mut self.heap))
+                } else {
+                    Ok(Value::NULL)
+                }
             }
             BuiltinFunction::StringMatch => {
                 let receiver = builtin.receiver.ok_or_else(|| {
@@ -7075,12 +7861,19 @@ impl VM {
                     } else {
                         Ok(obj_into_val(make_array(matches), &mut self.heap))
                     }
-                } else if let Some(found) = regex.find(&text) {
-                    let found_val = obj_into_val(
-                        Object::String(found.as_str().to_string().into()),
-                        &mut self.heap,
-                    );
-                    Ok(obj_into_val(make_array(vec![found_val]), &mut self.heap))
+                } else if let Some(captures) = regex.captures(&text) {
+                    let mut result = Vec::new();
+                    for i in 0..captures.len() {
+                        if let Some(m) = captures.get(i) {
+                            result.push(obj_into_val(
+                                Object::String(m.as_str().to_string().into()),
+                                &mut self.heap,
+                            ));
+                        } else {
+                            result.push(Value::UNDEFINED);
+                        }
+                    }
+                    Ok(obj_into_val(make_array(result), &mut self.heap))
                 } else {
                     Ok(Value::NULL)
                 }
@@ -7125,6 +7918,85 @@ impl VM {
                     out.push(obj_into_val(make_array(m), &mut self.heap));
                 }
                 Ok(obj_into_val(make_array(out), &mut self.heap))
+            }
+            BuiltinFunction::StringSearch => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("String.search missing receiver".to_string())
+                })?;
+                let text = match receiver {
+                    Object::String(s) => s,
+                    _ => return Ok(Value::from_i64(-1)),
+                };
+                let arg0 = args.first().map(|v| val_to_obj(*v, &self.heap));
+                let (pattern, flags) = match arg0.as_ref() {
+                    Some(Object::RegExp(re)) => (re.pattern.clone(), re.flags.clone()),
+                    Some(other) => (other.inspect(), String::new()),
+                    None => (String::new(), String::new()),
+                };
+                let regex = self.build_regex(&pattern, &flags)?;
+                if let Some(m) = regex.find(&text) {
+                    Ok(Value::from_i64(m.start() as i64))
+                } else {
+                    Ok(Value::from_i64(-1))
+                }
+            }
+            BuiltinFunction::StringConcat => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("String.concat missing receiver".to_string())
+                })?;
+                let text = match receiver {
+                    Object::String(s) => s,
+                    _ => return Ok(obj_into_val(Object::String(Rc::from("")), &mut self.heap)),
+                };
+                let mut result = text.to_string();
+                for arg in args {
+                    let s = val_inspect(*arg, &self.heap);
+                    result.push_str(&s);
+                }
+                Ok(obj_into_val(
+                    Object::String(Rc::from(result.as_str())),
+                    &mut self.heap,
+                ))
+            }
+            BuiltinFunction::StringTrimStart => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("String.trimStart missing receiver".to_string())
+                })?;
+                let text = match receiver {
+                    Object::String(s) => s,
+                    _ => return Ok(obj_into_val(Object::String(Rc::from("")), &mut self.heap)),
+                };
+                Ok(obj_into_val(
+                    Object::String(Rc::from(text.trim_start())),
+                    &mut self.heap,
+                ))
+            }
+            BuiltinFunction::StringTrimEnd => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("String.trimEnd missing receiver".to_string())
+                })?;
+                let text = match receiver {
+                    Object::String(s) => s,
+                    _ => return Ok(obj_into_val(Object::String(Rc::from("")), &mut self.heap)),
+                };
+                Ok(obj_into_val(
+                    Object::String(Rc::from(text.trim_end())),
+                    &mut self.heap,
+                ))
+            }
+            BuiltinFunction::StringFromCodePoint => {
+                let mut out = String::new();
+                for arg in args {
+                    let code = self.to_u32_val(*arg)?;
+                    let ch = char::from_u32(code).ok_or_else(|| {
+                        VMError::TypeError(format!(
+                            "Invalid code point: {}",
+                            code
+                        ))
+                    })?;
+                    out.push(ch);
+                }
+                Ok(obj_into_val(Object::String(out.into()), &mut self.heap))
             }
             BuiltinFunction::MapCtor => {
                 let map_obj = crate::object::MapObject::default();
@@ -8565,6 +9437,221 @@ impl VM {
                 self.queue_host_call(&kind, call_args, callback);
                 Ok(Value::UNDEFINED)
             }
+            BuiltinFunction::ErrorConstructor => {
+                let message = args
+                    .first()
+                    .map(|v| val_inspect(*v, &self.heap))
+                    .unwrap_or_default();
+                let err = Object::Error(Box::new(crate::object::ErrorObject {
+                    name: Rc::from("Error"),
+                    message: Rc::from(message.as_str()),
+                }));
+                Ok(obj_into_val(err, &mut self.heap))
+            }
+            BuiltinFunction::StringAt => {
+                let receiver = builtin.receiver.as_ref();
+                let s = match receiver {
+                    Some(Object::String(s)) => s.clone(),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let idx = args
+                    .first()
+                    .map(|v| self.to_number_val(*v))
+                    .transpose()?
+                    .unwrap_or(0.0) as i64;
+                let len = s.chars().count() as i64;
+                let actual = if idx < 0 { len + idx } else { idx };
+                if actual < 0 || actual >= len {
+                    return Ok(Value::UNDEFINED);
+                }
+                if let Some(ch) = s.chars().nth(actual as usize) {
+                    Ok(obj_into_val(
+                        Object::String(ch.to_string().into()),
+                        &mut self.heap,
+                    ))
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            BuiltinFunction::StringCodePointAt => {
+                let receiver = builtin.receiver.as_ref();
+                let s = match receiver {
+                    Some(Object::String(s)) => s.clone(),
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                let idx = args
+                    .first()
+                    .map(|v| self.to_number_val(*v))
+                    .transpose()?
+                    .unwrap_or(0.0) as usize;
+                if let Some(ch) = s.chars().nth(idx) {
+                    Ok(Value::from_i64(ch as i64))
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            BuiltinFunction::StringRaw => {
+                // String.raw(strings, ...values)
+                // strings is an object with a .raw property (array of raw strings)
+                let strings_val = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let strings_obj = val_to_obj(strings_val, &self.heap);
+                let raw_parts: Vec<String> = match strings_obj {
+                    Object::Hash(h) => {
+                        let hb = h.borrow();
+                        if let Some(raw_val) = hb.get_by_str("raw") {
+                            let raw_obj = val_to_obj(raw_val, &self.heap);
+                            match raw_obj {
+                                Object::Array(items) => {
+                                    items.borrow().iter().map(|v| {
+                                        let o = val_to_obj(*v, &self.heap);
+                                        match o {
+                                            Object::String(s) => s.to_string(),
+                                            _ => o.inspect(),
+                                        }
+                                    }).collect()
+                                }
+                                _ => vec![],
+                            }
+                        } else {
+                            vec![]
+                        }
+                    }
+                    _ => vec![],
+                };
+                let mut result = String::new();
+                for (i, part) in raw_parts.iter().enumerate() {
+                    result.push_str(part);
+                    if i + 1 < raw_parts.len() {
+                        if let Some(&val) = args.get(i + 1) {
+                            let obj = val_to_obj(val, &self.heap);
+                            match obj {
+                                Object::String(s) => result.push_str(&s),
+                                _ => result.push_str(&obj.inspect()),
+                            }
+                        }
+                    }
+                }
+                Ok(obj_into_val(Object::String(result.into()), &mut self.heap))
+            }
+            BuiltinFunction::StringNormalize => {
+                let receiver = builtin.receiver.as_ref();
+                match receiver {
+                    Some(Object::String(s)) => {
+                        // Basic NFC normalization — for ASCII strings this is identity
+                        // Full Unicode normalization would require the `unicode-normalization` crate
+                        Ok(obj_into_val(Object::String(s.clone()), &mut self.heap))
+                    }
+                    _ => Ok(Value::UNDEFINED),
+                }
+            }
+            BuiltinFunction::NumberToPrecision => {
+                let receiver = builtin.receiver.ok_or_else(|| {
+                    VMError::TypeError("Number.toPrecision missing receiver".to_string())
+                })?;
+                let n = self.to_number(&receiver)?;
+                let precision = args
+                    .first()
+                    .map(|v| self.to_u32_val(*v))
+                    .transpose()?
+                    .unwrap_or(0) as usize;
+                if precision == 0 {
+                    // No argument: just toString
+                    return Ok(obj_into_val(
+                        Object::String(format!("{}", n).into()),
+                        &mut self.heap,
+                    ));
+                }
+                let result = Self::format_to_precision(n, precision);
+                Ok(obj_into_val(Object::String(result.into()), &mut self.heap))
+            }
+            BuiltinFunction::StructuredClone => {
+                if args.is_empty() {
+                    return Ok(Value::UNDEFINED);
+                }
+                let val = args[0];
+                let cloned = self.deep_clone_value(val)?;
+                Ok(cloned)
+            }
+        }
+    }
+
+    fn format_to_precision(n: f64, precision: usize) -> String {
+        if !n.is_finite() {
+            return if n.is_nan() {
+                "NaN".to_string()
+            } else if n > 0.0 {
+                "Infinity".to_string()
+            } else {
+                "-Infinity".to_string()
+            };
+        }
+        if n == 0.0 {
+            if precision <= 1 {
+                return "0".to_string();
+            }
+            return format!("0.{}", "0".repeat(precision - 1));
+        }
+        let abs = n.abs();
+        let exp = abs.log10().floor() as i32;
+        // If exponent is within reasonable range, use fixed notation
+        if exp >= 0 && (exp as usize) < precision {
+            let decimal_places = precision - 1 - exp as usize;
+            let formatted = format!("{:.*}", decimal_places, n);
+            return formatted;
+        }
+        if exp < 0 && exp >= -4 {
+            let decimal_places = precision as i32 - 1 - exp;
+            let formatted = format!("{:.*}", decimal_places as usize, n);
+            return formatted;
+        }
+        // Use exponential notation
+        let mantissa_digits = precision - 1;
+        let formatted = format!("{:.*e}", mantissa_digits, n);
+        // JavaScript uses e+N format
+        if let Some(pos) = formatted.find('e') {
+            let (mantissa, exp_part) = formatted.split_at(pos);
+            let exp_str = &exp_part[1..];
+            let exp_val: i32 = exp_str.parse().unwrap_or(0);
+            if exp_val >= 0 {
+                format!("{}e+{}", mantissa, exp_val)
+            } else {
+                format!("{}e{}", mantissa, exp_val)
+            }
+        } else {
+            formatted
+        }
+    }
+
+    fn deep_clone_value(&mut self, val: Value) -> Result<Value, VMError> {
+        if !val.is_heap() {
+            return Ok(val); // primitives are already cloned by value
+        }
+        let obj = val_to_obj(val, &self.heap);
+        let cloned_obj = self.deep_clone_object(obj)?;
+        Ok(obj_into_val(cloned_obj, &mut self.heap))
+    }
+
+    fn deep_clone_object(&mut self, obj: Object) -> Result<Object, VMError> {
+        match obj {
+            Object::Array(items) => {
+                let borrowed = items.borrow();
+                let mut new_items = Vec::with_capacity(borrowed.len());
+                for &v in borrowed.iter() {
+                    new_items.push(self.deep_clone_value(v)?);
+                }
+                Ok(make_array(new_items))
+            }
+            Object::Hash(hash) => {
+                let h = hash.borrow();
+                let mut new_hash = HashObject::default();
+                for (k, &v) in h.pairs.iter() {
+                    let cloned_v = self.deep_clone_value(v)?;
+                    new_hash.insert_pair(k.clone(), cloned_v);
+                }
+                Ok(make_hash(new_hash))
+            }
+            // Primitives and other types: return as-is
+            other => Ok(other),
         }
     }
 
@@ -8584,9 +9671,35 @@ impl VM {
         });
     }
 
+    #[allow(dead_code)]
+    fn extract_builtin_array(
+        &self,
+        builtin: &BuiltinFunctionObject,
+    ) -> Result<Rc<crate::object::VmCell<Vec<Value>>>, VMError> {
+        if let Some(Object::Array(arr)) = &builtin.receiver {
+            return Ok(arr.clone());
+        }
+        Err(VMError::TypeError("expected array receiver".to_string()))
+    }
+
+    #[allow(dead_code)]
+    fn flatten_array(&self, items: &[Value], depth: usize, result: &mut Vec<Value>) {
+        for &v in items {
+            if depth > 0 && v.is_heap() {
+                let heap_obj = self.heap.get(v.heap_index());
+                if let Object::Array(arr) = heap_obj {
+                    self.flatten_array(&arr.borrow(), depth - 1, result);
+                    continue;
+                }
+            }
+            result.push(v);
+        }
+    }
+
     // ── Bridge helper methods ────────────────────────────────────────
 
     /// Extract a `[f64; 4]` from a Value that should be an array.
+    #[allow(dead_code)]
     fn extract_f64_array_4(&self, val: Option<Value>) -> [f64; 4] {
         let mut out = [0.0; 4];
         if let Some(v) = val {
@@ -8604,6 +9717,7 @@ impl VM {
     }
 
     /// Extract a `[f64; 3]` from a Value that should be an array.
+    #[allow(dead_code)]
     fn extract_f64_array_3(&self, val: Option<Value>) -> [f64; 3] {
         let mut out = [0.0; 3];
         if let Some(v) = val {
@@ -9172,6 +10286,8 @@ impl VM {
             max_stack_depth,
             register_count: _,
             inline_cache: func_cache,
+            closure_captures: _,
+            captured_values: _,
         } = func;
 
         // Set up locals for the new function.
@@ -9661,6 +10777,8 @@ impl VM {
             max_stack_depth,
             register_count,
             inline_cache: func_cache,
+            closure_captures: _,
+            captured_values: _,
         } = func;
 
         let is_register = register_count > 0;
@@ -9685,10 +10803,12 @@ impl VM {
         let saved_last_popped = self.last_popped.take();
         let saved_max_stack_depth = self.max_stack_depth;
         let saved_inline_cache = if num_cache_slots > 0 {
-            std::mem::replace(
-                &mut self.inline_cache,
-                std::mem::take(func_cache.borrow_mut()),
-            )
+            let mut taken = std::mem::take(func_cache.borrow_mut());
+            // If the cache was already taken (recursive call), allocate fresh
+            if taken.is_empty() {
+                taken = vec![(0, 0); num_cache_slots as usize];
+            }
+            std::mem::replace(&mut self.inline_cache, taken)
         } else {
             Vec::new()
         };
@@ -9936,6 +11056,7 @@ impl VM {
                     super_methods,
                     super_getters,
                     super_setters,
+                    super_constructor_chain,
                     field_initializers,
                     ..
                 } = *class_obj;
@@ -9950,6 +11071,7 @@ impl VM {
                     super_methods,
                     super_getters,
                     super_setters,
+                    super_constructor_chain,
                 };
 
                 // Run instance field initializers (parent fields first, then own)
@@ -9993,7 +11115,7 @@ impl VM {
                 self.push_val(out)?;
                 Ok(())
             }
-            // Handle `new Date()` — return a hash with getTime/toISOString methods
+            // Handle `new Date()` / `new Array()` — return appropriate objects
             Object::Hash(ref hash) => {
                 let h = hash.borrow();
                 let is_date = h.pairs.iter().any(|(k, _)| {
@@ -10001,8 +11123,38 @@ impl VM {
                         &*crate::intern::resolve(*sym) == "now"
                     } else { false }
                 });
+                let is_array = h.pairs.iter().any(|(k, _)| {
+                    if let HashKey::Sym(sym) = k {
+                        &*crate::intern::resolve(*sym) == "isArray"
+                    } else { false }
+                });
                 let _ = h;
-                if is_date {
+                if is_array {
+                    // new Array() / new Array(n) / new Array(a, b, c)
+                    let arr = if args.len() == 1 {
+                        let arg = args[0];
+                        let len = if arg.is_i32() {
+                            (unsafe { arg.as_i32_unchecked() }) as usize
+                        } else if arg.is_f64() {
+                            arg.as_f64() as usize
+                        } else {
+                            // single non-numeric arg → array with that element
+                            let items = vec![arg];
+                            self.push(make_array(items))?;
+                            self.new_target = saved_new_target;
+                            return Ok(());
+                        };
+                        let items = vec![Value::UNDEFINED; len];
+                        make_array(items)
+                    } else if args.is_empty() {
+                        make_array(vec![])
+                    } else {
+                        make_array(args.to_vec())
+                    };
+                    self.push(arr)?;
+                    self.new_target = saved_new_target;
+                    Ok(())
+                } else if is_date {
                     // Support `new Date()`, `new Date(ms)`, `new Date(string)`
                     let ms = if args.is_empty() {
                         epoch_millis_now()
@@ -10333,7 +11485,7 @@ impl VM {
     /// of the `yield` expression), then execution continues.
     ///
     /// Returns a `{value, done}` iterator result.
-    fn execute_generator_next(
+    pub(crate) fn execute_generator_next(
         &mut self,
         gen_rc: &Rc<crate::object::VmCell<crate::object::GeneratorObject>>,
         next_arg: Value,
@@ -10425,6 +11577,8 @@ impl VM {
             max_stack_depth,
             register_count,
             inline_cache: func_cache,
+            closure_captures: _,
+            captured_values: _,
         } = func;
 
         let is_register = register_count > 0;
@@ -10449,10 +11603,12 @@ impl VM {
         let saved_last_popped = self.last_popped.take();
         let saved_max_stack_depth = self.max_stack_depth;
         let saved_inline_cache = if num_cache_slots > 0 {
-            std::mem::replace(
-                &mut self.inline_cache,
-                std::mem::take(func_cache.borrow_mut()),
-            )
+            let mut taken = std::mem::take(func_cache.borrow_mut());
+            // If the cache was already taken (recursive call), allocate fresh
+            if taken.is_empty() {
+                taken = vec![(0, 0); num_cache_slots as usize];
+            }
+            std::mem::replace(&mut self.inline_cache, taken)
         } else {
             Vec::new()
         };
