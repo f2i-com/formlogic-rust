@@ -3171,6 +3171,13 @@ impl Compiler {
                         receiver: None,
                     })),
                 );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("log"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::EnvLog,
+                        receiver: None,
+                    })),
+                );
                 Some(make_hash(hash))
             }
             // ── draw ──

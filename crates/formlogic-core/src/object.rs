@@ -493,6 +493,7 @@ pub enum BuiltinFunction {
     // ── Env bridge ──
     EnvGet,
     EnvKeys,
+    EnvLog,
 
     // ── Draw bridge ──
     DrawRect,

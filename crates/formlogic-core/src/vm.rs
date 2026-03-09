@@ -9074,6 +9074,14 @@ impl VM {
                     Ok(obj_into_val(make_array(vec![]), &mut self.heap))
                 }
             }
+            BuiltinFunction::EnvLog => {
+                if let Some(ref env) = self.env {
+                    let level = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let message = args.get(1).map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    env.log(&level, &message);
+                }
+                Ok(Value::UNDEFINED)
+            }
 
             // ════════════════════════════════════════════════════════════════
             // Draw bridge
