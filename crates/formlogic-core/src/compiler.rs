@@ -3067,6 +3067,112 @@ impl Compiler {
                 );
                 Some(make_hash(hash))
             }
+            // ── http ──
+            "http" => {
+                let mut hash = HashObject::default();
+                hash.insert_pair_obj(
+                    Self::hash_key_string("get"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::HttpGet,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("post"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::HttpPost,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("put"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::HttpPut,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("delete"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::HttpDelete,
+                        receiver: None,
+                    })),
+                );
+                Some(make_hash(hash))
+            }
+            // ── fs ──
+            "fs" => {
+                let mut hash = HashObject::default();
+                hash.insert_pair_obj(
+                    Self::hash_key_string("readFile"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsReadFile,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("writeFile"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsWriteFile,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("appendFile"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsAppendFile,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("exists"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsExists,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("listDir"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsListDir,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("deleteFile"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsDeleteFile,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("mkdir"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::FsMkdir,
+                        receiver: None,
+                    })),
+                );
+                Some(make_hash(hash))
+            }
+            // ── env ──
+            "env" => {
+                let mut hash = HashObject::default();
+                hash.insert_pair_obj(
+                    Self::hash_key_string("get"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::EnvGet,
+                        receiver: None,
+                    })),
+                );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("keys"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::EnvKeys,
+                        receiver: None,
+                    })),
+                );
+                Some(make_hash(hash))
+            }
             // ── draw ──
             "draw" => {
                 let mut hash = HashObject::default();

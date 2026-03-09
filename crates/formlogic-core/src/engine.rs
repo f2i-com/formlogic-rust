@@ -8,7 +8,7 @@ use crate::object::{CompiledFunctionObject, Object};
 use crate::parser::parse_program_from_source;
 use crate::rcompiler::RCompiler;
 use crate::value::{obj_into_val, val_to_obj, Heap, Value};
-use crate::vm::VM;
+use crate::vm::{ExecutionQuota, VM};
 
 const BYTECODE_CACHE_CAPACITY: usize = 256;
 
@@ -192,7 +192,10 @@ impl ScriptState {
     }
 
     /// Call a named function defined in the script.
+    /// Resets the execution quota so each call gets a fresh instruction/time budget.
     pub fn call_function(&mut self, name: &str, args: &[Object]) -> Result<Object, String> {
+        self.vm.quota = ExecutionQuota::default();
+
         let &slot = self
             .globals_table
             .get(name)
@@ -483,6 +486,34 @@ impl ScriptState {
     /// Attach an input/event state backend to the VM.
     pub fn set_input(&mut self, input: Box<dyn crate::input_bridge::InputBridge>) {
         self.vm.input = Some(input);
+    }
+
+    /// Attach an HTTP backend to the VM (server-side).
+    pub fn set_http(&mut self, http: Box<dyn crate::http_bridge::HttpBridge>) {
+        self.vm.http = Some(http);
+    }
+
+    /// Attach a file system backend to the VM (server-side, scoped).
+    pub fn set_fs(&mut self, fs: Box<dyn crate::fs_bridge::FsBridge>) {
+        self.vm.fs = Some(fs);
+    }
+
+    /// Attach an environment variable backend to the VM (server-side).
+    pub fn set_env(&mut self, env: Box<dyn crate::env_bridge::EnvBridge>) {
+        self.vm.env = Some(env);
+    }
+
+    /// Set execution limits for script calls. Useful for server environments
+    /// where untrusted scripts must be bounded.
+    pub fn set_execution_limits(
+        &mut self,
+        max_instructions: Option<u64>,
+        max_wall_time_ms: Option<u64>,
+    ) {
+        self.vm.config.max_instructions = max_instructions;
+        self.vm.config.max_wall_time_ms = max_wall_time_ms;
+        self.vm.enforce_limits =
+            max_instructions.is_some() || max_wall_time_ms.is_some();
     }
 
     /// Read-only access to the VM (for inspecting localStorage etc.).

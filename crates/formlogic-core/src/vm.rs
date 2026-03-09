@@ -277,6 +277,12 @@ pub struct VM {
     pub layout: Option<Box<dyn crate::layout_bridge::LayoutBridge>>,
     /// Pluggable input/event state (e.g. winit on native).
     pub input: Option<Box<dyn crate::input_bridge::InputBridge>>,
+    /// Pluggable HTTP backend (server-side).
+    pub http: Option<Box<dyn crate::http_bridge::HttpBridge>>,
+    /// Pluggable file system backend (server-side, scoped).
+    pub fs: Option<Box<dyn crate::fs_bridge::FsBridge>>,
+    /// Pluggable environment variable backend (server-side).
+    pub env: Option<Box<dyn crate::env_bridge::EnvBridge>>,
     /// Event listeners registered via `window.addEventListener(type, handler)`.
     /// Maps event type (e.g. "keydown") to a list of handler Values (heap refs).
     pub event_listeners: std::collections::HashMap<String, Vec<Value>>,
@@ -401,6 +407,9 @@ impl VM {
             draw: None,
             layout: None,
             input: None,
+            http: None,
+            fs: None,
+            env: None,
             event_listeners: std::collections::HashMap::new(),
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
@@ -501,6 +510,9 @@ impl VM {
             draw: None,
             layout: None,
             input: None,
+            http: None,
+            fs: None,
+            env: None,
             event_listeners: std::collections::HashMap::new(),
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
@@ -8642,15 +8654,19 @@ impl VM {
                         .first()
                         .map(|v| val_inspect(*v, &self.heap))
                         .unwrap_or_default();
-                    let records = db.query(&collection);
-                    let items: Vec<Value> = records
-                        .into_iter()
-                        .map(|r| {
-                            let obj = self.db_record_to_object(r);
-                            obj_into_val(obj, &mut self.heap)
-                        })
-                        .collect();
-                    Ok(obj_into_val(make_array(items), &mut self.heap))
+                    match db.query(&collection) {
+                        Ok(records) => {
+                            let items: Vec<Value> = records
+                                .into_iter()
+                                .map(|r| {
+                                    let obj = self.db_record_to_object(r);
+                                    obj_into_val(obj, &mut self.heap)
+                                })
+                                .collect();
+                            Ok(obj_into_val(make_array(items), &mut self.heap))
+                        }
+                        Err(e) => Err(VMError::TypeError(format!("db.query error: {}", e))),
+                    }
                 } else {
                     Ok(obj_into_val(make_array(vec![]), &mut self.heap))
                 }
@@ -8668,9 +8684,13 @@ impl VM {
                     "{}".to_string()
                 };
                 if let Some(ref mut db) = self.db {
-                    let record = db.create(&collection, &data_json);
-                    let obj = self.db_record_to_object(record);
-                    Ok(obj_into_val(obj, &mut self.heap))
+                    match db.create(&collection, &data_json) {
+                        Ok(record) => {
+                            let obj = self.db_record_to_object(record);
+                            Ok(obj_into_val(obj, &mut self.heap))
+                        }
+                        Err(e) => Err(VMError::TypeError(format!("db.create error: {}", e))),
+                    }
                 } else {
                     Ok(Value::NULL)
                 }
@@ -8689,11 +8709,12 @@ impl VM {
                 };
                 if let Some(ref mut db) = self.db {
                     match db.update(&id, &data_json) {
-                        Some(record) => {
+                        Ok(Some(record)) => {
                             let obj = self.db_record_to_object(record);
                             Ok(obj_into_val(obj, &mut self.heap))
                         }
-                        None => Ok(Value::NULL),
+                        Ok(None) => Ok(Value::NULL),
+                        Err(e) => Err(VMError::TypeError(format!("db.update error: {}", e))),
                     }
                 } else {
                     Ok(Value::NULL)
@@ -8705,7 +8726,9 @@ impl VM {
                         .first()
                         .map(|v| val_inspect(*v, &self.heap))
                         .unwrap_or_default();
-                    db.delete(&id);
+                    if let Err(e) = db.delete(&id) {
+                        return Err(VMError::TypeError(format!("db.delete error: {}", e)));
+                    }
                 }
                 Ok(Value::UNDEFINED)
             }
@@ -8719,7 +8742,9 @@ impl VM {
                         .get(1)
                         .map(|v| val_inspect(*v, &self.heap))
                         .unwrap_or_default();
-                    db.hard_delete(&collection, &id);
+                    if let Err(e) = db.hard_delete(&collection, &id) {
+                        return Err(VMError::TypeError(format!("db.hardDelete error: {}", e)));
+                    }
                 }
                 Ok(Value::UNDEFINED)
             }
@@ -8734,11 +8759,12 @@ impl VM {
                         .map(|v| val_inspect(*v, &self.heap))
                         .unwrap_or_default();
                     match db.get(&collection, &id) {
-                        Some(record) => {
+                        Ok(Some(record)) => {
                             let obj = self.db_record_to_object(record);
                             Ok(obj_into_val(obj, &mut self.heap))
                         }
-                        None => Ok(Value::NULL),
+                        Ok(None) => Ok(Value::NULL),
+                        Err(e) => Err(VMError::TypeError(format!("db.get error: {}", e))),
                     }
                 } else {
                     Ok(Value::NULL)
@@ -8817,6 +8843,235 @@ impl VM {
                     }
                 } else {
                     Ok(Value::NULL)
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // HTTP bridge
+            // ════════════════════════════════════════════════════════════════
+            BuiltinFunction::HttpGet => {
+                if let Some(ref http) = self.http {
+                    let url = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match http.get(&url) {
+                        Ok(resp) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(resp.status as i64));
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(resp.ok));
+                            let body_val = obj_into_val(Object::String(resp.body.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                        Err(e) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(false));
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(0));
+                            let err_val = obj_into_val(Object::String(e.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("error"), err_val);
+                            let body_val = obj_into_val(Object::String("".into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            BuiltinFunction::HttpPost => {
+                if let Some(ref http) = self.http {
+                    let url = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let body = args.get(1).map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let ct = args.get(2).map(|v| val_inspect(*v, &self.heap)).unwrap_or_else(|| "application/json".into());
+                    match http.post(&url, &body, &ct) {
+                        Ok(resp) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(resp.status as i64));
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(resp.ok));
+                            let body_val = obj_into_val(Object::String(resp.body.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                        Err(e) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(false));
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(0));
+                            let err_val = obj_into_val(Object::String(e.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("error"), err_val);
+                            let body_val = obj_into_val(Object::String("".into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            BuiltinFunction::HttpPut => {
+                if let Some(ref http) = self.http {
+                    let url = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let body = args.get(1).map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let ct = args.get(2).map(|v| val_inspect(*v, &self.heap)).unwrap_or_else(|| "application/json".into());
+                    match http.put(&url, &body, &ct) {
+                        Ok(resp) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(resp.status as i64));
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(resp.ok));
+                            let body_val = obj_into_val(Object::String(resp.body.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                        Err(e) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(false));
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(0));
+                            let err_val = obj_into_val(Object::String(e.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("error"), err_val);
+                            let body_val = obj_into_val(Object::String("".into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            BuiltinFunction::HttpDelete => {
+                if let Some(ref http) = self.http {
+                    let url = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match http.delete(&url) {
+                        Ok(resp) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(resp.status as i64));
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(resp.ok));
+                            let body_val = obj_into_val(Object::String(resp.body.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                        Err(e) => {
+                            let mut hash = crate::object::HashObject::default();
+                            hash.insert_pair(HashKey::from_string("ok"), Value::from_bool(false));
+                            hash.insert_pair(HashKey::from_string("status"), Value::from_i64(0));
+                            let err_val = obj_into_val(Object::String(e.into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("error"), err_val);
+                            let body_val = obj_into_val(Object::String("".into()), &mut self.heap);
+                            hash.insert_pair(HashKey::from_string("body"), body_val);
+                            Ok(obj_into_val(make_hash(hash), &mut self.heap))
+                        }
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // FS bridge
+            // ════════════════════════════════════════════════════════════════
+            BuiltinFunction::FsReadFile => {
+                if let Some(ref fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.read_file(&path) {
+                        Ok(content) => Ok(obj_into_val(Object::String(content.into()), &mut self.heap)),
+                        Err(_) => Ok(Value::NULL),
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            BuiltinFunction::FsWriteFile => {
+                if let Some(ref mut fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let content = args.get(1).map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.write_file(&path, &content) {
+                        Ok(()) => Ok(Value::from_bool(true)),
+                        Err(_) => Ok(Value::from_bool(false)),
+                    }
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+            BuiltinFunction::FsAppendFile => {
+                if let Some(ref mut fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    let content = args.get(1).map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.append_file(&path, &content) {
+                        Ok(()) => Ok(Value::from_bool(true)),
+                        Err(_) => Ok(Value::from_bool(false)),
+                    }
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+            BuiltinFunction::FsExists => {
+                if let Some(ref fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    Ok(Value::from_bool(fs.exists(&path)))
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+            BuiltinFunction::FsListDir => {
+                if let Some(ref fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.list_dir(&path) {
+                        Ok(entries) => {
+                            let items: Vec<Value> = entries
+                                .into_iter()
+                                .map(|e| obj_into_val(Object::String(e.into()), &mut self.heap))
+                                .collect();
+                            Ok(obj_into_val(make_array(items), &mut self.heap))
+                        }
+                        Err(_) => Ok(obj_into_val(make_array(vec![]), &mut self.heap)),
+                    }
+                } else {
+                    Ok(obj_into_val(make_array(vec![]), &mut self.heap))
+                }
+            }
+            BuiltinFunction::FsDeleteFile => {
+                if let Some(ref mut fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.delete_file(&path) {
+                        Ok(()) => Ok(Value::from_bool(true)),
+                        Err(_) => Ok(Value::from_bool(false)),
+                    }
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+            BuiltinFunction::FsMkdir => {
+                if let Some(ref mut fs) = self.fs {
+                    let path = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match fs.mkdir(&path) {
+                        Ok(()) => Ok(Value::from_bool(true)),
+                        Err(_) => Ok(Value::from_bool(false)),
+                    }
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // Env bridge
+            // ════════════════════════════════════════════════════════════════
+            BuiltinFunction::EnvGet => {
+                if let Some(ref env) = self.env {
+                    let name = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                    match env.get(&name) {
+                        Some(val) => Ok(obj_into_val(Object::String(val.into()), &mut self.heap)),
+                        None => Ok(Value::NULL),
+                    }
+                } else {
+                    Ok(Value::NULL)
+                }
+            }
+            BuiltinFunction::EnvKeys => {
+                if let Some(ref env) = self.env {
+                    let keys = env.keys();
+                    let items: Vec<Value> = keys
+                        .into_iter()
+                        .map(|k| obj_into_val(Object::String(k.into()), &mut self.heap))
+                        .collect();
+                    Ok(obj_into_val(make_array(items), &mut self.heap))
+                } else {
+                    Ok(obj_into_val(make_array(vec![]), &mut self.heap))
                 }
             }
 

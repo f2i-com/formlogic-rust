@@ -167,7 +167,7 @@ impl JsDbBridge {
 }
 
 impl DbBridge for JsDbBridge {
-    fn query(&self, collection: &str) -> Vec<DbRecord> {
+    fn query(&self, collection: &str) -> Result<Vec<DbRecord>, String> {
         let result = self.call_method("query", &[JsValue::from_str(collection)]);
         let mut records = Vec::new();
         if let Ok(arr) = result.dyn_into::<Array>() {
@@ -178,46 +178,41 @@ impl DbBridge for JsDbBridge {
                 }
             }
         }
-        records
+        Ok(records)
     }
 
-    fn create(&mut self, collection: &str, data: &str) -> DbRecord {
+    fn create(&mut self, collection: &str, data: &str) -> Result<DbRecord, String> {
         // Parse the JSON string back to a JS object for the JS bridge
         let data_js = js_sys::JSON::parse(data).unwrap_or(JsValue::UNDEFINED);
         let result = self.call_method_write("create", &[JsValue::from_str(collection), data_js]);
-        self.jsvalue_to_record(&result).unwrap_or(DbRecord {
-            id: String::new(),
-            collection: collection.to_string(),
-            data: data.to_string(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            data_parsed: None,
-        })
+        self.jsvalue_to_record(&result).ok_or_else(|| "db.create returned null".to_string())
     }
 
-    fn update(&mut self, id: &str, data: &str) -> Option<DbRecord> {
+    fn update(&mut self, id: &str, data: &str) -> Result<Option<DbRecord>, String> {
         let data_js = js_sys::JSON::parse(data).unwrap_or(JsValue::UNDEFINED);
         let result = self.call_method_write("update", &[JsValue::from_str(id), data_js]);
-        self.jsvalue_to_record(&result)
+        Ok(self.jsvalue_to_record(&result))
     }
 
-    fn delete(&mut self, id: &str) {
+    fn delete(&mut self, id: &str) -> Result<(), String> {
         self.call_method_write("delete", &[JsValue::from_str(id)]);
+        Ok(())
     }
 
-    fn hard_delete(&mut self, collection: &str, id: &str) {
+    fn hard_delete(&mut self, collection: &str, id: &str) -> Result<(), String> {
         self.call_method_write(
             "hardDelete",
             &[JsValue::from_str(collection), JsValue::from_str(id)],
         );
+        Ok(())
     }
 
-    fn get(&self, collection: &str, id: &str) -> Option<DbRecord> {
+    fn get(&self, collection: &str, id: &str) -> Result<Option<DbRecord>, String> {
         let result = self.call_method(
             "get",
             &[JsValue::from_str(collection), JsValue::from_str(id)],
         );
-        self.jsvalue_to_record(&result)
+        Ok(self.jsvalue_to_record(&result))
     }
 
     fn start_sync(&mut self, room: &str) {

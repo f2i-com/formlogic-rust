@@ -475,6 +475,25 @@ pub enum BuiltinFunction {
     DbGetSyncStatus,
     DbGetSavedSyncRoom,
 
+    // ── HTTP bridge ──
+    HttpGet,
+    HttpPost,
+    HttpPut,
+    HttpDelete,
+
+    // ── FS bridge ──
+    FsReadFile,
+    FsWriteFile,
+    FsAppendFile,
+    FsExists,
+    FsListDir,
+    FsDeleteFile,
+    FsMkdir,
+
+    // ── Env bridge ──
+    EnvGet,
+    EnvKeys,
+
     // ── Draw bridge ──
     DrawRect,
     DrawRoundedRect,

@@ -21,12 +21,12 @@ pub struct DbSyncStatus {
 
 /// Trait for pluggable XDB database backends (e.g. SQLite on native).
 pub trait DbBridge {
-    fn query(&self, collection: &str) -> Vec<DbRecord>;
-    fn create(&mut self, collection: &str, data: &str) -> DbRecord;
-    fn update(&mut self, id: &str, data: &str) -> Option<DbRecord>;
-    fn delete(&mut self, id: &str);
-    fn hard_delete(&mut self, collection: &str, id: &str);
-    fn get(&self, collection: &str, id: &str) -> Option<DbRecord>;
+    fn query(&self, collection: &str) -> Result<Vec<DbRecord>, String>;
+    fn create(&mut self, collection: &str, data: &str) -> Result<DbRecord, String>;
+    fn update(&mut self, id: &str, data: &str) -> Result<Option<DbRecord>, String>;
+    fn delete(&mut self, id: &str) -> Result<(), String>;
+    fn hard_delete(&mut self, collection: &str, id: &str) -> Result<(), String>;
+    fn get(&self, collection: &str, id: &str) -> Result<Option<DbRecord>, String>;
     fn start_sync(&mut self, room: &str);
     fn stop_sync(&mut self, room: Option<&str>);
     fn get_sync_status(&self, room: Option<&str>) -> DbSyncStatus;
