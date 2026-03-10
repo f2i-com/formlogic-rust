@@ -498,6 +498,15 @@ impl WasmFormLogicEngine {
             script_state.set_local_storage(Box::new(JsLocalStorageBridge { obj: ls_js }));
         }
 
+        // 2b. Set safe-by-default execution limits for untrusted bundles.
+        // Prevents UI freezes and DoS from hostile/buggy .logic code.
+        // 50M instructions + 5s wall time is generous for UI interactions
+        // but stops infinite loops and CPU exhaustion.
+        script_state.set_execution_limits(
+            Some(50_000_000),  // 50M instructions
+            Some(5_000),       // 5s wall time
+        );
+
         // 3. Run top-level code (executes `let window = {};` etc.)
         script_state
             .run_init()
@@ -804,6 +813,21 @@ impl WasmFormLogicEngine {
         state.resolve_host_callback(call_id, obj)
             .map_err(|e| JsValue::from_str(&e))?;
         Ok(())
+    }
+
+    /// Override VM execution limits. Pass 0 to disable a limit.
+    /// Defaults (set in init_script): 50M instructions, 5s wall time.
+    #[wasm_bindgen(js_name = setExecutionLimits)]
+    pub fn set_execution_limits_js(
+        &mut self,
+        max_instructions: u32,
+        max_wall_time_ms: u32,
+    ) {
+        if let Some(ref mut state) = self.state {
+            let instr = if max_instructions > 0 { Some(max_instructions as u64) } else { None };
+            let wall = if max_wall_time_ms > 0 { Some(max_wall_time_ms as u64) } else { None };
+            state.set_execution_limits(instr, wall);
+        }
     }
 }
 
