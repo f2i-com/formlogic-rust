@@ -162,6 +162,27 @@ impl ScriptState {
         self.vm.run_register().map_err(|e| format!("VM error: {:?}", e))
     }
 
+    /// Snapshot global slot values (up to high-water mark).
+    /// Used to restore globals to post-init state between calls, preventing
+    /// state bleed across requests on the same worker thread.
+    pub fn snapshot_globals(&self) -> Vec<Value> {
+        let hwm = self.vm.globals.high_water_mark();
+        let mut snapshot = Vec::with_capacity(hwm);
+        for i in 0..hwm {
+            snapshot.push(unsafe { self.vm.globals.get_unchecked(i) });
+        }
+        snapshot
+    }
+
+    /// Restore global slot values from a snapshot taken after init.
+    /// Any globals written since the snapshot are reverted, ensuring each
+    /// handler call starts from a clean state.
+    pub fn restore_globals(&mut self, snapshot: &[Value]) {
+        for (i, &val) in snapshot.iter().enumerate() {
+            unsafe { self.vm.globals.set_unchecked(i, val) };
+        }
+    }
+
     /// Return a reference to the globals table (name → slot index).
     pub fn globals_table(&self) -> &FxHashMap<String, u16> {
         &self.globals_table
