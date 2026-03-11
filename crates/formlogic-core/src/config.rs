@@ -15,7 +15,13 @@ impl Default for FormLogicConfig {
     fn default() -> Self {
         Self {
             max_instructions: Some(100_000_000),
-            max_wall_time_ms: Some(86_400_000),
+            // Safe-by-default: 5s wall time prevents runaway scripts from
+            // consuming resources indefinitely. Integrators hosting trusted
+            // scripts can raise this via set_execution_limits(). The previous
+            // 24h default was dangerous for any deployment that forgot to
+            // override it — a single infinite loop would pin a worker thread
+            // for an entire day.
+            max_wall_time_ms: Some(5_000),
             await_timeout_ms: Some(30_000),
             enable_vm_profiling: false,
             operators: default_operators().into_iter().collect(),
