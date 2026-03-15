@@ -98,6 +98,143 @@ impl FormLogicEngine {
         Ok(result)
     }
 
+    /// Evaluate source code and return the result as a JSON string.
+    /// Unlike `eval()` which returns an Object (with potential `[ref]` for nested heap values),
+    /// this method serializes the result while the heap is still accessible, producing
+    /// a complete JSON representation with all nested values fully resolved.
+    pub fn eval_to_json(&self, source: &str) -> Result<String, String> {
+        let cached = { self.bytecode_cache.borrow().get(source).cloned() };
+        let cached = if let Some(cached) = cached {
+            cached
+        } else {
+            let (program, errors) = parse_program_from_source(source);
+            if !errors.is_empty() {
+                return Err(format!("Parser errors: {}", errors.join(", ")));
+            }
+
+            let compiled = RCompiler::new().compile_program(&program)?;
+            let compiled = CachedBytecode {
+                instructions: Rc::new(compiled.instructions),
+                constants: Rc::new(compiled.constants),
+                num_cache_slots: compiled.num_cache_slots,
+                max_stack_depth: compiled.max_stack_depth,
+                register_count: compiled.register_count,
+            };
+            {
+                let mut cache = self.bytecode_cache.borrow_mut();
+                if cache.len() >= BYTECODE_CACHE_CAPACITY {
+                    cache.swap_remove_index(0);
+                }
+                cache.insert(source.to_string(), compiled.clone());
+            }
+            compiled
+        };
+
+        let mut vm = self.vm_pool.borrow_mut().take().unwrap_or_else(|| {
+            VM::new_from_rc(
+                Rc::clone(&cached.instructions),
+                Rc::clone(&cached.constants),
+                self.config.clone(),
+                crate::vm::STACK_SIZE,
+                cached.num_cache_slots,
+                cached.max_stack_depth,
+            )
+        });
+
+        vm.reset_for_run(
+            Rc::clone(&cached.instructions),
+            Rc::clone(&cached.constants),
+            cached.num_cache_slots,
+            cached.max_stack_depth,
+            cached.register_count,
+        );
+
+        let run_result = vm.run_register();
+        let last = vm.last_popped.take().unwrap_or(Value::UNDEFINED);
+
+        // Serialize to JSON while heap is still available
+        let json = Self::value_to_json(last, &vm.heap);
+
+        *self.vm_pool.borrow_mut() = Some(vm);
+        run_result.map_err(|e| format!("VM error: {:?}", e))?;
+        Ok(json)
+    }
+
+    /// Convert a NaN-boxed Value to a JSON string, resolving all heap references.
+    fn value_to_json(val: Value, heap: &Heap) -> String {
+        if val.is_i32() {
+            return format!("{}", unsafe { val.as_i32_unchecked() });
+        }
+        if val.is_f64() {
+            let f = val.as_f64();
+            if f.is_nan() { return "null".to_string(); }
+            if f.is_infinite() { return "null".to_string(); }
+            if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+                return format!("{}", f as i64);
+            }
+            return format!("{}", f);
+        }
+        if val.is_bool() {
+            return if unsafe { val.as_bool_unchecked() } { "true" } else { "false" }.to_string();
+        }
+        if val.is_null() || val.is_undefined() {
+            return "null".to_string();
+        }
+        if val.is_inline_str() {
+            let (buf, len) = val.inline_str_buf();
+            let s = std::str::from_utf8(&buf[..len]).unwrap_or("");
+            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        }
+        if val.is_heap() {
+            return Self::object_to_json(heap.get(val.heap_index()), heap);
+        }
+        "null".to_string()
+    }
+
+    /// Convert an Object to a JSON string, resolving all nested heap references.
+    fn object_to_json(obj: &Object, heap: &Heap) -> String {
+        match obj {
+            Object::Integer(v) => format!("{}", v),
+            Object::Float(v) => {
+                if v.is_nan() || v.is_infinite() { "null".to_string() }
+                else if v.fract() == 0.0 && v.abs() < i64::MAX as f64 { format!("{}", *v as i64) }
+                else { format!("{}", v) }
+            }
+            Object::Boolean(v) => format!("{}", v),
+            Object::Null | Object::Undefined => "null".to_string(),
+            Object::String(v) => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
+            Object::Array(items) => {
+                let borrowed = items.borrow();
+                let elements: Vec<String> = borrowed.iter()
+                    .map(|v| Self::value_to_json(*v, heap))
+                    .collect();
+                format!("[{}]", elements.join(", "))
+            }
+            Object::Hash(h) => {
+                let h = h.borrow();
+                let entries: Vec<String> = h.pairs.keys().enumerate()
+                    .map(|(i, k)| {
+                        let v = h.values.get(i)
+                            .map(|v| Self::value_to_json(*v, heap))
+                            .unwrap_or_else(|| "null".to_string());
+                        format!("\"{}\": {}", k, v)
+                    })
+                    .collect();
+                format!("{{{}}}", entries.join(", "))
+            }
+            Object::Instance(inst) => {
+                // Serialize instance fields as a JSON object
+                let entries: Vec<String> = inst.fields.iter()
+                    .map(|(k, v)| format!("\"{}\": {}", k, Self::object_to_json(v, heap)))
+                    .collect();
+                format!("{{{}}}", entries.join(", "))
+            }
+            Object::Error(err) => format!("\"Error: {}\"", err.message.replace('"', "\\\"")),
+            Object::ReturnValue(v) => Self::object_to_json(v, heap),
+            _ => format!("\"{}\"", obj.inspect().replace('"', "\\\"")),
+        }
+    }
+
     /// Parse, compile, and execute top-level code, keeping the VM alive for
     /// subsequent `call_function` / `get_global` / `set_global` calls.
     pub fn init_script(&self, source: &str) -> Result<ScriptState, String> {
