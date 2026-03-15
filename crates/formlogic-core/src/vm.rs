@@ -1,9 +1,9 @@
 use regex::RegexBuilder;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
 use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
 use std::time::Instant;
 use std::{cell::UnsafeCell, rc::Rc};
 
@@ -20,9 +20,10 @@ use crate::value::{obj_into_val, obj_to_val, val_inspect, val_to_obj, Heap, Valu
 // ── Platform-safe time helpers ────────────────────────────────────────────
 // On WASM, use js_sys for Date.now() and Math.random() for real values.
 // On native, use std::time.
+// On riscv32 (zkVM), time is not available — return deterministic values.
 
 /// Get the current epoch time in milliseconds (platform-safe).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
 fn epoch_millis_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -35,8 +36,13 @@ fn epoch_millis_now() -> f64 {
     js_sys::Date::now()
 }
 
+#[cfg(target_arch = "riscv32")]
+fn epoch_millis_now() -> f64 {
+    0.0
+}
+
 /// Generate a seed for the xorshift64 RNG (platform-safe).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
 fn rng_seed_now() -> u64 {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -50,6 +56,12 @@ fn rng_seed_now() -> u64 {
     // On WASM, use js_sys::Date::now() as seed for better entropy
     let seed = js_sys::Date::now() as u64;
     if seed == 0 { 0x12345678_9abcdef0 } else { seed }
+}
+
+// On riscv32 (zkVM), use a fixed seed — determinism is desired.
+#[cfg(target_arch = "riscv32")]
+fn rng_seed_now() -> u64 {
+    0x12345678_9abcdef0
 }
 
 pub const STACK_SIZE: usize = 2048;
@@ -71,7 +83,7 @@ pub const MAX_STRING_LENGTH: usize = 10_000_000;
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionQuota {
     pub instructions: u64,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
     pub started_at: Option<Instant>,
     #[cfg(target_arch = "wasm32")]
     pub started_at_ms: Option<f64>,
@@ -700,7 +712,7 @@ impl VM {
     #[inline(never)]
     pub(crate) fn check_execution_limits(&mut self) -> Result<(), VMError> {
         self.quota.instructions += 1;
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
         if self.quota.started_at.is_none() {
             self.quota.started_at = Some(Instant::now());
         }
@@ -724,7 +736,7 @@ impl VM {
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
         if let Some(max_ms) = self.config.max_wall_time_ms {
             let elapsed = self
                 .quota

@@ -3,6 +3,10 @@ name = "formlogic-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+zkvm = []
+
 [dependencies]
 indexmap = "2"
 itoa = "1"

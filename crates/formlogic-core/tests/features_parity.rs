@@ -12679,6 +12679,33 @@ fn regex_replace_simple() {
     assert_eval_str(r#" "foo bar".replace(/foo/, "baz") "#, "baz bar");
 }
 
+#[test]
+fn regex_escaped_slash() {
+    // Regex with escaped slash (\/) must not end the pattern prematurely
+    assert_eval_str(
+        r#" "<b>hello</b>".replace(/<\/b>/g, "") "#,
+        "<b>hello",
+    );
+}
+
+#[test]
+fn regex_escaped_slash_in_complex_pattern() {
+    // Complex regex like those used to strip HTML/thinking tags
+    assert_eval_str(
+        r#" "<think>secret</think> visible".replace(/<think[^>]*>[\s\S]*?<\/think[^>]*>/gi, "") "#,
+        " visible",
+    );
+}
+
+#[test]
+fn regex_char_class_with_caret() {
+    // Character class with negation [^>]
+    assert_eval_str(
+        r#" "<div class='x'>text</div>".replace(/<[^>]*>/g, "") "#,
+        "text",
+    );
+}
+
 // --- Map ---
 #[test]
 fn map_set_get_has_b12() {

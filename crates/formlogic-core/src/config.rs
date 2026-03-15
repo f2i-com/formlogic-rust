@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use crate::token::{default_operators, TokenType};
 
@@ -8,7 +8,7 @@ pub struct FormLogicConfig {
     pub max_wall_time_ms: Option<u64>,
     pub await_timeout_ms: Option<u64>,
     pub enable_vm_profiling: bool,
-    pub operators: HashMap<&'static str, TokenType>,
+    pub operators: IndexMap<&'static str, TokenType>,
 }
 
 impl Default for FormLogicConfig {

@@ -210,12 +210,14 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            escaped = self.ch == b'\\' && !escaped;
+            if escaped {
+                escaped = false;
+            } else if self.ch == b'\\' {
+                escaped = true;
+            }
+
             pattern.push(self.ch as char);
             self.read_char();
-            if escaped && self.ch != b'\\' {
-                escaped = false;
-            }
         }
 
         if self.ch != b'/' {

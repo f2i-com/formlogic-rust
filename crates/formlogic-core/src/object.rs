@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+#[cfg(not(target_arch = "riscv32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use indexmap::IndexMap;
@@ -223,10 +224,26 @@ impl HashKey {
     }
 }
 
+#[cfg(not(target_arch = "riscv32"))]
 static NEXT_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(not(target_arch = "riscv32"))]
 fn next_object_id() -> u64 {
     NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+// riscv32 (zkVM) is single-threaded — use a simple Cell counter instead of atomics.
+#[cfg(target_arch = "riscv32")]
+fn next_object_id() -> u64 {
+    use std::cell::Cell;
+    thread_local! {
+        static NEXT_OBJECT_ID: Cell<u64> = Cell::new(1);
+    }
+    NEXT_OBJECT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
