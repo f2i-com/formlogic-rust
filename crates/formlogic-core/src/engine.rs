@@ -38,6 +38,14 @@ impl Default for FormLogicEngine {
 }
 
 impl FormLogicEngine {
+    pub fn with_config(config: FormLogicConfig) -> Self {
+        Self {
+            config,
+            bytecode_cache: RefCell::new(IndexMap::new()),
+            vm_pool: RefCell::new(None),
+        }
+    }
+
     pub fn eval(&self, source: &str) -> Result<Object, String> {
         let cached = { self.bytecode_cache.borrow().get(source).cloned() };
         let cached = if let Some(cached) = cached {
