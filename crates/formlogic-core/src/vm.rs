@@ -304,6 +304,11 @@ pub struct VM {
     pub host_callbacks: std::collections::HashMap<u32, Value>,
     /// Auto-incrementing ID for host calls.
     pub next_host_call_id: u32,
+    /// ZK trace capture: when enabled, records (clk, pc, opcode, val_a, val_b, val_dst, const, aux)
+    /// at each instruction for feeding into the STARK prover.
+    pub trace_enabled: bool,
+    pub trace_steps: Vec<(u64, u64, u8, u64, u64, u64, u64, u64)>,
+    pub trace_clk: u64,
 }
 
 impl VM {
@@ -352,7 +357,7 @@ impl VM {
     }
 
     pub fn new(bytecode: Bytecode, config: FormLogicConfig) -> Self {
-        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some();
+        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some();
         let mut stack = Vec::with_capacity(STACK_SIZE);
         stack.reserve(STACK_SIZE);
         let num_cache_slots = bytecode.num_cache_slots;
@@ -426,6 +431,9 @@ impl VM {
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
             next_host_call_id: 1,
+            trace_enabled: false,
+            trace_steps: Vec::new(),
+            trace_clk: 0,
         }
     }
 
@@ -457,7 +465,7 @@ impl VM {
         num_cache_slots: u16,
         max_stack_depth: u16,
     ) -> Self {
-        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some();
+        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some();
         let mut stack = Vec::with_capacity(STACK_SIZE);
         stack.reserve(STACK_SIZE);
         let instructions = Self::ensure_terminated_instructions_rc(instructions);
@@ -529,6 +537,9 @@ impl VM {
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
             next_host_call_id: 1,
+            trace_enabled: false,
+            trace_steps: Vec::new(),
+            trace_clk: 0,
         }
     }
 
@@ -732,6 +743,26 @@ impl VM {
                 return Err(VMError::ExecutionTimeout(format!(
                     "Execution exceeded maximum instruction count: {}",
                     max
+                )));
+            }
+        }
+
+        // Check heap limits to prevent OOM from unbounded allocation.
+        // The Rust process aborts on OOM, killing ALL concurrent executions.
+        if let Some(max_heap) = self.config.max_heap_objects {
+            if self.heap.allocated_count() > max_heap {
+                return Err(VMError::ExecutionTimeout(format!(
+                    "Heap object limit exceeded: {} objects (limit: {})",
+                    self.heap.allocated_count(), max_heap
+                )));
+            }
+        }
+        if let Some(max_bytes) = self.config.max_heap_bytes {
+            let used = self.heap.estimated_memory_bytes();
+            if used > max_bytes {
+                return Err(VMError::ExecutionTimeout(format!(
+                    "Heap memory limit exceeded: {}MB (limit: {}MB)",
+                    used / (1024 * 1024), max_bytes / (1024 * 1024)
                 )));
             }
         }

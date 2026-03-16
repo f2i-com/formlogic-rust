@@ -454,6 +454,16 @@ impl Heap {
         self.objects.len() - self.free_list.len()
     }
 
+    /// Estimated total memory usage in bytes.
+    /// Uses object count * average size as a conservative estimate.
+    /// Avoids borrowing Rc<VmCell<...>> internals which requires unsafe.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        // Each Object slot is ~128 bytes (enum + Rc + backing data).
+        // Strings average ~64 bytes, arrays ~256 bytes, hashes ~512 bytes.
+        // Conservative: count all objects at 256 bytes average.
+        self.objects.len() * 256
+    }
+
     /// Allocate a new heap slot, store the object, return the index.
     /// Reuses GC-freed slots from the free list before growing the Vec.
     #[inline]

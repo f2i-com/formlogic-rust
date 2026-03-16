@@ -160,6 +160,72 @@ impl FormLogicEngine {
         Ok(json)
     }
 
+    /// Evaluate source code, return JSON result + execution trace for ZK proving.
+    /// The trace captures (clk, pc, opcode, val_a, val_b, val_dst, const_val, aux) per step.
+    pub fn eval_with_trace(&self, source: &str) -> Result<(String, Vec<(u64, u64, u8, u64, u64, u64, u64, u64)>), String> {
+        let cached = { self.bytecode_cache.borrow().get(source).cloned() };
+        let cached = if let Some(cached) = cached {
+            cached
+        } else {
+            let (program, errors) = parse_program_from_source(source);
+            if !errors.is_empty() {
+                return Err(format!("Parser errors: {}", errors.join(", ")));
+            }
+            let compiled = RCompiler::new().compile_program(&program)?;
+            let compiled = CachedBytecode {
+                instructions: Rc::new(compiled.instructions),
+                constants: Rc::new(compiled.constants),
+                num_cache_slots: compiled.num_cache_slots,
+                max_stack_depth: compiled.max_stack_depth,
+                register_count: compiled.register_count,
+            };
+            {
+                let mut cache = self.bytecode_cache.borrow_mut();
+                if cache.len() >= BYTECODE_CACHE_CAPACITY {
+                    cache.swap_remove_index(0);
+                }
+                cache.insert(source.to_string(), compiled.clone());
+            }
+            compiled
+        };
+
+        let mut vm = self.vm_pool.borrow_mut().take().unwrap_or_else(|| {
+            VM::new_from_rc(
+                Rc::clone(&cached.instructions),
+                Rc::clone(&cached.constants),
+                self.config.clone(),
+                crate::vm::STACK_SIZE,
+                cached.num_cache_slots,
+                cached.max_stack_depth,
+            )
+        });
+
+        vm.reset_for_run(
+            Rc::clone(&cached.instructions),
+            Rc::clone(&cached.constants),
+            cached.num_cache_slots,
+            cached.max_stack_depth,
+            cached.register_count,
+        );
+
+        // Enable trace capture
+        vm.trace_enabled = true;
+        vm.trace_steps.clear();
+        vm.trace_clk = 0;
+
+        let run_result = vm.run_register();
+        let last = vm.last_popped.take().unwrap_or(Value::UNDEFINED);
+        let json = Self::value_to_json(last, &vm.heap);
+
+        // Extract trace before returning VM to pool
+        let trace = std::mem::take(&mut vm.trace_steps);
+        vm.trace_enabled = false;
+
+        *self.vm_pool.borrow_mut() = Some(vm);
+        run_result.map_err(|e| format!("VM error: {:?}", e))?;
+        Ok((json, trace))
+    }
+
     /// Convert a NaN-boxed Value to a JSON string, resolving all heap references.
     fn value_to_json(val: Value, heap: &Heap) -> String {
         if val.is_i32() {

@@ -151,6 +151,10 @@ impl VM {
             // Skip the from_byte bounds check to save one branch per dispatch.
             let op: ROp = unsafe { std::mem::transmute(*self.inst_ptr.add(ip)) };
 
+            // Save pre-execution state for ZK trace
+            let trace_ip = ip;
+            let trace_op = op as u8;
+
             match op {
                 ROp::LoadConst => {
                     let dst = self.read_u16(ip + 1) as usize;
@@ -2535,13 +2539,241 @@ impl VM {
                 }
 
                 ROp::Halt => {
+                    if self.trace_enabled {
+                        self.trace_steps.push((self.trace_clk, trace_ip as u64, 76, 0, 0, 0, 0, 0));
+                        self.trace_clk += 1;
+                    }
                     return Ok(());
                 }
                 ROp::HaltValue => {
                     let src = self.read_u16(ip + 1) as usize;
-                    self.last_popped = Some(unsafe { *regs.add(src) });
+                    let val = unsafe { *regs.add(src) };
+                    self.last_popped = Some(val);
+                    if self.trace_enabled {
+                        let vd = if val.is_i32() { (unsafe { val.as_i32_unchecked() }) as u64 } else { val.bits() };
+                        self.trace_steps.push((self.trace_clk, trace_ip as u64, 77, 0, 0, vd, 0, 0));
+                        self.trace_clk += 1;
+                    }
                     return Ok(());
                 }
+            }
+
+            // Post-execution ZK trace capture — records the state AFTER the instruction ran
+            if self.trace_enabled {
+                let (va, vb, vd, cv, ax) = match trace_op {
+                    // Binary arithmetic: store SEMANTIC numeric values (not NaN-boxed bits)
+                    // so field element arithmetic in the STARK constraint matches.
+                    8..=13 | 24..=29 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let left_r = self.read_u16(trace_ip + 3) as usize;
+                        let right_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            let lv = *regs.add(left_r);
+                            let rv = *regs.add(right_r);
+                            let dv = *regs.add(dst_r);
+                            // Extract semantic numeric values for ZK constraints
+                            let la = if lv.is_i32() { lv.as_i32_unchecked() as u64 } else { lv.as_f64().to_bits() };
+                            let ra = if rv.is_i32() { rv.as_i32_unchecked() as u64 } else { rv.as_f64().to_bits() };
+                            let da = if dv.is_i32() { dv.as_i32_unchecked() as u64 } else { dv.as_f64().to_bits() };
+                            (la, ra, da, 0u64, 0u64)
+                        }
+                    }
+                    // Comparisons: result is 1 (true) or 0 (false) in AUX
+                    14..=21 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let left_r = self.read_u16(trace_ip + 3) as usize;
+                        let right_r = self.read_u16(trace_ip + 5) as usize;
+                        let dst_val = unsafe { (*regs.add(dst_r)).bits() };
+                        let cmp_bool = if dst_val == Value::TRUE.bits() { 1u64 } else { 0u64 };
+                        unsafe {
+                            let lv = *regs.add(left_r);
+                            let rv = *regs.add(right_r);
+                            let la = if lv.is_i32() { lv.as_i32_unchecked() as u64 } else { lv.bits() };
+                            let ra = if rv.is_i32() { rv.as_i32_unchecked() as u64 } else { rv.bits() };
+                            (la, ra, dst_val, 0u64, cmp_bool)
+                        }
+                    }
+                    // LoadConst: dst = const (semantic value for integers)
+                    0 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let dv = unsafe { *regs.add(dst_r) };
+                        let da = if dv.is_i32() { unsafe { dv.as_i32_unchecked() as u64 } } else { dv.bits() };
+                        (0, 0, da, da, 0)
+                    }
+                    // LoadTrue/False/Null/Undef: dst = literal (use NaN-boxed since constraints match)
+                    1..=4 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let dv = unsafe { *regs.add(dst_r) };
+                        let da = if dv.is_i32() { unsafe { dv.as_i32_unchecked() as u64 } } else { dv.bits() };
+                        (0, 0, da, da, 0)
+                    }
+                    // Move: dst = src (semantic)
+                    5 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let src_r = self.read_u16(trace_ip + 3) as usize;
+                        let dv = unsafe { *regs.add(dst_r) };
+                        let sv = unsafe { *regs.add(src_r) };
+                        let da = if dv.is_i32() { unsafe { dv.as_i32_unchecked() as u64 } } else { dv.bits() };
+                        let sa = if sv.is_i32() { unsafe { sv.as_i32_unchecked() as u64 } } else { sv.bits() };
+                        (sa, 0, da, 0, 0)
+                    }
+                    // Jump
+                    35 => {
+                        (0, 0, 0, 0, ip as u64) // aux = actual jump target (new ip)
+                    }
+                    // JumpIfNot, JumpIfTruthy
+                    36 | 37 => {
+                        let cond_r = self.read_u16(trace_ip + 1) as usize;
+                        let cv = unsafe { (*regs.add(cond_r)).bits() };
+                        (cv, 0, 0, 0, ip as u64)
+                    }
+                    // Unary ops: NEG (30), NOT (31)
+                    30 | 31 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let src_r = self.read_u16(trace_ip + 3) as usize;
+                        let dv = unsafe { *regs.add(dst_r) };
+                        let sv = unsafe { *regs.add(src_r) };
+                        let da = if dv.is_i32() { unsafe { dv.as_i32_unchecked() as u64 } } else { dv.bits() };
+                        let sa = if sv.is_i32() { unsafe { sv.as_i32_unchecked() as u64 } } else { sv.bits() };
+                        // For NOT: dst is boolean (0 or 1)
+                        let da = if trace_op == 31 {
+                            if dv == Value::TRUE { 1u64 } else { 0u64 }
+                        } else { da };
+                        (sa, 0, da, 0, 0)
+                    }
+                    // GetGlobal (6): dst = loaded value, const = global index
+                    6 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let idx = self.read_u16(trace_ip + 3) as u64;
+                        let dv = unsafe { *regs.add(dst_r) };
+                        let da = if dv.is_i32() { unsafe { dv.as_i32_unchecked() as u64 } } else { dv.bits() };
+                        (da, 0, da, idx, 0) // val_a = val_dst = loaded value, const = index
+                    }
+                    // SetGlobal (7): val_a = stored value, const = global index
+                    7 => {
+                        let idx = self.read_u16(trace_ip + 1) as u64;
+                        let src_r = self.read_u16(trace_ip + 3) as usize;
+                        let sv = unsafe { *regs.add(src_r) };
+                        let sa = if sv.is_i32() { unsafe { sv.as_i32_unchecked() as u64 } } else { sv.bits() };
+                        (sa, 0, 0, idx, 0)
+                    }
+                    // MOD (12): a % b = dst, quotient in AUX
+                    12 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let left_r = self.read_u16(trace_ip + 3) as usize;
+                        let right_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            let lv = *regs.add(left_r);
+                            let rv = *regs.add(right_r);
+                            let dv = *regs.add(dst_r);
+                            let la = if lv.is_i32() { lv.as_i32_unchecked() as u64 } else { lv.bits() };
+                            let ra = if rv.is_i32() { rv.as_i32_unchecked() as u64 } else { rv.bits() };
+                            let da = if dv.is_i32() { dv.as_i32_unchecked() as u64 } else { dv.bits() };
+                            // Compute quotient for the constraint: a = b * quotient + dst
+                            let quotient = if ra != 0 { la / ra } else { 0 };
+                            (la, ra, da, 0, quotient)
+                        }
+                    }
+                    // Call (38), CallGlobal (62): capture func ref + nargs
+                    38 | 62 => {
+                        let nargs = self.read_u8_at(trace_ip + 5) as u64;
+                        (0, nargs, 0, 0, 0)
+                    }
+                    // Return (41): capture return value
+                    41 => {
+                        let src_r = self.read_u16(trace_ip + 1) as usize;
+                        let rv = unsafe { *regs.add(src_r) };
+                        let ra = if rv.is_i32() { (unsafe { rv.as_i32_unchecked() }) as u64 } else { rv.bits() };
+                        (0, 0, ra, 0, 0)
+                    }
+                    // ReturnUndef (42)
+                    42 => (0, 0, 0, 0, 0),
+                    // POW (13): binary op like MUL
+                    13 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let left_r = self.read_u16(trace_ip + 3) as usize;
+                        let right_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            let lv = *regs.add(left_r);
+                            let rv = *regs.add(right_r);
+                            let dv = *regs.add(dst_r);
+                            let la = if lv.is_i32() { lv.as_i32_unchecked() as u64 } else { lv.bits() };
+                            let ra = if rv.is_i32() { rv.as_i32_unchecked() as u64 } else { rv.bits() };
+                            let da = if dv.is_i32() { dv.as_i32_unchecked() as u64 } else { dv.bits() };
+                            (la, ra, da, 0, 0)
+                        }
+                    }
+                    // Bitwise ops (24-29): capture operands + result
+                    24..=29 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let left_r = self.read_u16(trace_ip + 3) as usize;
+                        let right_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            let lv = *regs.add(left_r);
+                            let rv = *regs.add(right_r);
+                            let dv = *regs.add(dst_r);
+                            let la = if lv.is_i32() { lv.as_i32_unchecked() as u64 } else { lv.bits() };
+                            let ra = if rv.is_i32() { rv.as_i32_unchecked() as u64 } else { rv.bits() };
+                            let da = if dv.is_i32() { dv.as_i32_unchecked() as u64 } else { dv.bits() };
+                            (la, ra, da, 0, 0)
+                        }
+                    }
+                    // Typeof (33): result in dst
+                    33 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let src_r = self.read_u16(trace_ip + 3) as usize;
+                        unsafe {
+                            ((*regs.add(src_r)).bits(), 0, (*regs.add(dst_r)).bits(), 0, 0)
+                        }
+                    }
+                    // GetProp (50): capture object, result
+                    50 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let obj_r = self.read_u16(trace_ip + 3) as usize;
+                        unsafe {
+                            ((*regs.add(obj_r)).bits(), 0, (*regs.add(dst_r)).bits(), 0, 0)
+                        }
+                    }
+                    // SetProp (51): capture object, value
+                    51 => {
+                        let obj_r = self.read_u16(trace_ip + 1) as usize;
+                        let src_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            ((*regs.add(obj_r)).bits(), (*regs.add(src_r)).bits(), 0, 0, 0)
+                        }
+                    }
+                    // Index read (54): obj[key] -> dst
+                    54 => {
+                        let dst_r = self.read_u16(trace_ip + 1) as usize;
+                        let obj_r = self.read_u16(trace_ip + 3) as usize;
+                        let key_r = self.read_u16(trace_ip + 5) as usize;
+                        unsafe {
+                            ((*regs.add(obj_r)).bits(), (*regs.add(key_r)).bits(),
+                             (*regs.add(dst_r)).bits(), 0, 0)
+                        }
+                    }
+                    // Array (46): capture count
+                    46 => {
+                        let count = self.read_u16(trace_ip + 5) as u64;
+                        (0, count, 0, 0, 0)
+                    }
+                    // Hash (47): capture count
+                    47 => {
+                        let count = self.read_u16(trace_ip + 5) as u64;
+                        (0, count, 0, 0, 0)
+                    }
+                    // Fused: TestLtConstJump (64), TestLeConstJump (65)
+                    64 | 65 => {
+                        let r = self.read_u16(trace_ip + 1) as usize;
+                        let rv = unsafe { *regs.add(r) };
+                        let ra = if rv.is_i32() { (unsafe { rv.as_i32_unchecked() }) as u64 } else { rv.bits() };
+                        (ra, 0, 0, 0, ip as u64)
+                    }
+                    // All other opcodes
+                    _ => (0, 0, 0, 0, 0),
+                };
+                self.trace_steps.push((self.trace_clk, trace_ip as u64, trace_op, va, vb, vd, cv, ax));
+                self.trace_clk += 1;
             }
         }
     }

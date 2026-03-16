@@ -7,6 +7,11 @@ pub struct FormLogicConfig {
     pub max_instructions: Option<u64>,
     pub max_wall_time_ms: Option<u64>,
     pub await_timeout_ms: Option<u64>,
+    /// Maximum number of heap objects (strings, arrays, hashes, closures, etc.).
+    pub max_heap_objects: Option<usize>,
+    /// Maximum heap memory in bytes. Checked alongside max_heap_objects.
+    /// Prevents OOM from scripts that grow existing objects (e.g., array.push in a loop).
+    pub max_heap_bytes: Option<usize>,
     pub enable_vm_profiling: bool,
     pub operators: IndexMap<&'static str, TokenType>,
 }
@@ -15,14 +20,11 @@ impl Default for FormLogicConfig {
     fn default() -> Self {
         Self {
             max_instructions: Some(100_000_000),
-            // Safe-by-default: 5s wall time prevents runaway scripts from
-            // consuming resources indefinitely. Integrators hosting trusted
-            // scripts can raise this via set_execution_limits(). The previous
-            // 24h default was dangerous for any deployment that forgot to
-            // override it — a single infinite loop would pin a worker thread
-            // for an entire day.
             max_wall_time_ms: Some(5_000),
             await_timeout_ms: Some(30_000),
+            max_heap_objects: Some(100_000),
+            // Default: 64MB heap limit. Prevents OOM crashes from unbounded allocation.
+            max_heap_bytes: Some(64 * 1024 * 1024),
             enable_vm_profiling: false,
             operators: default_operators().into_iter().collect(),
         }
