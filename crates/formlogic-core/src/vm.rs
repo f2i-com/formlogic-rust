@@ -357,7 +357,7 @@ impl VM {
     }
 
     pub fn new(bytecode: Bytecode, config: FormLogicConfig) -> Self {
-        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some();
+        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some() || config.abort_flag.is_some();
         let mut stack = Vec::with_capacity(STACK_SIZE);
         stack.reserve(STACK_SIZE);
         let num_cache_slots = bytecode.num_cache_slots;
@@ -465,7 +465,7 @@ impl VM {
         num_cache_slots: u16,
         max_stack_depth: u16,
     ) -> Self {
-        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some();
+        let enforce_limits = config.max_instructions.is_some() || config.max_wall_time_ms.is_some() || config.max_heap_objects.is_some() || config.max_heap_bytes.is_some() || config.abort_flag.is_some();
         let mut stack = Vec::with_capacity(STACK_SIZE);
         stack.reserve(STACK_SIZE);
         let instructions = Self::ensure_terminated_instructions_rc(instructions);
@@ -726,6 +726,18 @@ impl VM {
         #[cfg(not(any(target_arch = "wasm32", target_arch = "riscv32")))]
         if self.quota.started_at.is_none() {
             self.quota.started_at = Some(Instant::now());
+        }
+
+        // Check external abort flag (set by host on outer timeout).
+        // Checked every ~16K instructions (same cadence as other periodic checks)
+        // to avoid atomic load overhead on every single instruction.
+        if (self.quota.instructions & 0x3fff) == 0 {
+            if let Some(ref flag) = self.config.abort_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(VMError::ExecutionTimeout(
+                        "Execution aborted by host (external timeout)".to_string()));
+                }
+            }
         }
 
         let max_instructions = self.config.max_instructions;
