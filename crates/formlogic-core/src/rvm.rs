@@ -2563,7 +2563,8 @@ impl VM {
                 let (va, vb, vd, cv, ax) = match trace_op {
                     // Binary arithmetic: store SEMANTIC numeric values (not NaN-boxed bits)
                     // so field element arithmetic in the STARK constraint matches.
-                    8..=13 | 24..=29 => {
+                    // Excludes 12 (MOD) and 13 (POW) which have specialized handling below.
+                    8..=11 => {
                         let dst_r = self.read_u16(trace_ip + 1) as usize;
                         let left_r = self.read_u16(trace_ip + 3) as usize;
                         let right_r = self.read_u16(trace_ip + 5) as usize;
