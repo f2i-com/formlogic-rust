@@ -234,6 +234,12 @@ impl FormLogicEngine {
         Ok((json, trace))
     }
 
+    /// Produce a correctly escaped JSON string literal using serde_json.
+    /// Handles all control characters, unicode, backslashes, and quotes.
+    fn json_string(s: &str) -> String {
+        serde_json::to_string(s).unwrap_or_else(|_| "null".to_string())
+    }
+
     /// Convert a NaN-boxed Value to a JSON string, resolving all heap references.
     fn value_to_json(val: Value, heap: &Heap) -> String {
         if val.is_i32() {
@@ -257,7 +263,7 @@ impl FormLogicEngine {
         if val.is_inline_str() {
             let (buf, len) = val.inline_str_buf();
             let s = std::str::from_utf8(&buf[..len]).unwrap_or("");
-            return format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+            return Self::json_string(s);
         }
         if val.is_heap() {
             return Self::object_to_json(heap.get(val.heap_index()), heap);
@@ -276,7 +282,7 @@ impl FormLogicEngine {
             }
             Object::Boolean(v) => format!("{}", v),
             Object::Null | Object::Undefined => "null".to_string(),
-            Object::String(v) => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
+            Object::String(v) => Self::json_string(v),
             Object::Array(items) => {
                 let borrowed = items.borrow();
                 let elements: Vec<String> = borrowed.iter()
@@ -291,21 +297,20 @@ impl FormLogicEngine {
                         let v = h.values.get(i)
                             .map(|v| Self::value_to_json(*v, heap))
                             .unwrap_or_else(|| "null".to_string());
-                        format!("\"{}\": {}", k, v)
+                        format!("{}: {}", Self::json_string(&k.to_string()), v)
                     })
                     .collect();
                 format!("{{{}}}", entries.join(", "))
             }
             Object::Instance(inst) => {
-                // Serialize instance fields as a JSON object
                 let entries: Vec<String> = inst.fields.iter()
-                    .map(|(k, v)| format!("\"{}\": {}", k, Self::object_to_json(v, heap)))
+                    .map(|(k, v)| format!("{}: {}", Self::json_string(k), Self::object_to_json(v, heap)))
                     .collect();
                 format!("{{{}}}", entries.join(", "))
             }
-            Object::Error(err) => format!("\"Error: {}\"", err.message.replace('"', "\\\"")),
+            Object::Error(err) => Self::json_string(&format!("Error: {}", err.message)),
             Object::ReturnValue(v) => Self::object_to_json(v, heap),
-            _ => format!("\"{}\"", obj.inspect().replace('"', "\\\"")),
+            _ => Self::json_string(&obj.inspect()),
         }
     }
 
