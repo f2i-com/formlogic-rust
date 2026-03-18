@@ -578,6 +578,8 @@ pub enum BuiltinFunction {
     // ── Generic host call bridge ──
     /// host.call(kind, argsArray, callback) — queues an async call to the host.
     HostCall,
+    /// host.callSync(kind, argsArray) — synchronous host call, returns JSON result.
+    HostCallSync,
 
     // ── Error constructor ──
     ErrorConstructor,

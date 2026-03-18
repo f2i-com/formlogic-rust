@@ -3522,6 +3522,13 @@ impl Compiler {
                         receiver: None,
                     })),
                 );
+                hash.insert_pair_obj(
+                    Self::hash_key_string("callSync"),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::HostCallSync,
+                        receiver: None,
+                    })),
+                );
                 Some(make_hash(hash))
             }
 

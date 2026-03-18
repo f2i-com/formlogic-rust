@@ -15,7 +15,7 @@ use crate::object::{
     CompiledFunctionObject, HashKey, HashObject, Object, PromiseObject, PromiseState,
     SuperRefObject,
 };
-use crate::value::{obj_into_val, obj_to_val, val_inspect, val_to_obj, Heap, Value};
+use crate::value::{json_value_to_vm_value, obj_into_val, obj_to_val, val_inspect, val_to_obj, Heap, Value};
 
 // ── Platform-safe time helpers ────────────────────────────────────────────
 // On WASM, use js_sys for Date.now() and Math.random() for real values.
@@ -9836,6 +9836,37 @@ impl VM {
                 let callback = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 self.queue_host_call(&kind, call_args, callback);
                 Ok(Value::UNDEFINED)
+            }
+            BuiltinFunction::HostCallSync => {
+                // host.callSync(kind, argsArray) — synchronous host call, returns parsed JSON
+                let kind = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
+                let mut call_args = Vec::new();
+                if let Some(&arr_val) = args.get(1) {
+                    if arr_val.is_heap() {
+                        if let Object::Array(ref items) = self.heap.get(arr_val.heap_index()) {
+                            for item in items.borrow().iter() {
+                                call_args.push(val_inspect(*item, &self.heap));
+                            }
+                        }
+                    } else {
+                        // Single string argument
+                        call_args.push(val_inspect(arr_val, &self.heap));
+                    }
+                }
+                if let Some(ref handler) = self.config.sync_host_call {
+                    match handler(&kind, &call_args) {
+                        Ok(json_result) => {
+                            // Parse JSON result into a VM value
+                            match serde_json::from_str::<serde_json::Value>(&json_result) {
+                                Ok(val) => Ok(json_value_to_vm_value(val, &mut self.heap)),
+                                Err(_) => Ok(obj_into_val(Object::String(Rc::from(json_result.as_str())), &mut self.heap)),
+                            }
+                        }
+                        Err(e) => Err(VMError::TypeError(format!("host.callSync error: {e}"))),
+                    }
+                } else {
+                    Err(VMError::TypeError("host.callSync: no sync handler configured".into()))
+                }
             }
             BuiltinFunction::ErrorConstructor => {
                 let message = args

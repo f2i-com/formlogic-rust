@@ -871,3 +871,48 @@ mod tests {
         assert!(matches!(back, Object::String(s) if &*s == "xy"));
     }
 }
+
+/// Convert a serde_json::Value into a VM Value, allocating objects on the heap.
+pub fn json_value_to_vm_value(json: serde_json::Value, heap: &mut Heap) -> Value {
+    match json {
+        serde_json::Value::Null => Value::NULL,
+        serde_json::Value::Bool(b) => Value::from_bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    Value::from_i32(i as i32)
+                } else {
+                    Value::from_f64(i as f64)
+                }
+            } else {
+                Value::from_f64(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => {
+            obj_into_val(Object::String(std::rc::Rc::from(s.as_str())), heap)
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Value> = arr.into_iter()
+                .map(|v| json_value_to_vm_value(v, heap))
+                .collect();
+            obj_into_val(
+                Object::Array(std::rc::Rc::new(crate::object::VmCell::new(items))),
+                heap,
+            )
+        }
+        serde_json::Value::Object(map) => {
+            let mut hash = crate::object::HashObject::with_capacity(map.len());
+            for (k, v) in map {
+                let vm_val = json_value_to_vm_value(v, heap);
+                hash.insert_pair(
+                    crate::object::HashKey::from_owned_string(k),
+                    vm_val,
+                );
+            }
+            obj_into_val(
+                Object::Hash(std::rc::Rc::new(crate::object::VmCell::new(hash))),
+                heap,
+            )
+        }
+    }
+}
