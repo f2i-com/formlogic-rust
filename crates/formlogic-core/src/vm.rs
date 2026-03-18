@@ -304,6 +304,8 @@ pub struct VM {
     pub host_callbacks: std::collections::HashMap<u32, Value>,
     /// Auto-incrementing ID for host calls.
     pub next_host_call_id: u32,
+    /// Counter for synchronous host calls per execution (DoS prevention).
+    pub host_call_count: u32,
     /// ZK trace capture: when enabled, records (clk, pc, opcode, val_a, val_b, val_dst, const, aux)
     /// at each instruction for feeding into the STARK prover.
     pub trace_enabled: bool,
@@ -431,6 +433,7 @@ impl VM {
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
             next_host_call_id: 1,
+            host_call_count: 0,
             trace_enabled: false,
             trace_steps: Vec::new(),
             trace_clk: 0,
@@ -537,6 +540,7 @@ impl VM {
             pending_host_calls: Vec::new(),
             host_callbacks: std::collections::HashMap::new(),
             next_host_call_id: 1,
+            host_call_count: 0,
             trace_enabled: false,
             trace_steps: Vec::new(),
             trace_clk: 0,
@@ -9839,6 +9843,13 @@ impl VM {
             }
             BuiltinFunction::HostCallSync => {
                 // host.callSync(kind, argsArray) — synchronous host call, returns parsed JSON
+                // Limit host calls per execution to prevent thread pool exhaustion
+                self.host_call_count += 1;
+                if self.host_call_count > 100 {
+                    return Err(VMError::TypeError(
+                        "Too many host.callSync calls (max 100 per execution)".into(),
+                    ));
+                }
                 let kind = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();
                 let mut call_args = Vec::new();
                 if let Some(&arr_val) = args.get(1) {
